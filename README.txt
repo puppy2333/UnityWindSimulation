@@ -35,10 +35,18 @@ USAGE INSTRUCTIONS
 2. General Settings: Select the "FvmControllerGO" object in the Hierarchy 
                      window to modify general solver settings.
 3. Sim Settings    : Modify the detailed simulation parameters in scripts 
-                     located in the "Code/Config" folder.
+                     located in the "Assets/Code/Config" folder.
 4. Run Simulation  : Click the "Play" button at the top center of the Unity 
                      Editor to start the simulation.
 5. UI & Controls   : Further operating instructions and interactive controls 
                      are displayed directly on the screen during gameplay.
+
+RESULTS & VALIDATION
+--------------------
+1. Unity Settings   : The configuration file used to produce comparison 
+                      results is located in "Assets/Code/Config/AijBuilding0".
+2. OpenFOAM Settings: The corresponding OpenFOAM case setup, used as the 
+                      baseline for validation and comparison, is provided in 
+                      the dictionary "OpenFOAMSetting".
 
 ================================================================================

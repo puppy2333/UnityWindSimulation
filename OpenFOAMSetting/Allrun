@@ -1,0 +1,36 @@
+#!/bin/sh
+cd "${0%/*}" || exit
+. ${WM_PROJECT_DIR:?}/bin/tools/RunFunctions
+
+# ------------------------------------------------------------------------------
+echo "Cleaning up previous logs..."
+rm -rf processor* log.*
+rm -rf 0
+rm -rf constant/polyMesh
+
+echo "1. Running blockMesh..."
+runApplication blockMesh
+
+echo "2. Running topoSet..."
+runApplication topoSet
+
+echo "3. Running subsetMesh..."
+runApplication subsetMesh fluidCells -patch solidBnd -overwrite
+
+echo "Restoring 0 directory..."
+cp -r 0.orig 0
+
+echo "4. Running changeDictionary..."
+runApplication changeDictionary
+
+echo "5. Running checkMesh..."
+runApplication checkMesh
+
+echo "6. Running setExprFields..."
+runApplication setExprFields
+
+echo "6. Running decomposePar..."
+runApplication decomposePar
+
+echo "7. Running pimpleFoam..."
+runParallel pimpleFoam &

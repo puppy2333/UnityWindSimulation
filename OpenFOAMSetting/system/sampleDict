@@ -1,0 +1,113 @@
+sampleDict
+{
+    type            sets;
+    libs            ("libsampling.so");
+
+    interpolationScheme cell;
+    setFormat raw;
+    fields (
+        U p nut
+    );
+
+    sets
+    (
+        // Ux_Profile_X20
+        // {
+        //     type        uniform;
+        //     axis        z;
+        //     start       (19.75 9.75 0.25);
+        //     end         (19.75 9.75 39.75);
+        //     nPoints     80;
+        // }
+
+        Ux_Centerline
+        {
+            type        uniform;
+            axis        x;
+            start       (0.5 19.5 19.5);
+            end         (79.5 19.5 19.5);
+            nPoints     80;
+        }
+
+        Ux_Ground_y4_Centerline
+        {
+            type        uniform;
+            axis        x;
+            start       (0.5 4.5 19.5);
+            end         (79.5 4.5 19.5);
+            nPoints     80;
+        }
+
+        Ux_Ground_y1_Centerline
+        {
+            type        uniform;
+            axis        x;
+            start       (0.5 1.5 19.5);
+            end         (79.5 1.5 19.5);
+            nPoints     80;
+        }
+
+        Ux_Ground_y0_Centerline
+        {
+            type        uniform;
+            axis        x;
+            start       (0.5 0.5 19.5);
+            end         (79.5 0.5 19.5);
+            nPoints     80;
+        }
+
+        sampleYAxis_x25_zCenter
+        {
+            type        uniform;
+            axis        y;
+            start       (25.5 0.5 19.5);
+            end         (25.5 39.5 19.5);
+            nPoints     40;
+        }
+
+        sampleYAxis_x30_zCenter
+        {
+            type        uniform;
+            axis        y;
+            start       (30.5 0.5 19.5);
+            end         (30.5 39.5 19.5);
+            nPoints     40;
+        }
+
+        sampleYAxis_x35_zCenter
+        {
+            type        uniform;
+            axis        y;
+            start       (35.5 0.5 19.5);
+            end         (35.5 39.5 19.5);
+            nPoints     40;
+        }
+
+        sampleZAxis_x30_y0
+        {
+            type        uniform;
+            axis        z;
+            start       (35.5 0.5 0.5);
+            end         (35.5 0.5 39.5);
+            nPoints     40;
+        }
+
+        sampleZAxis_x35_y1
+        {
+            type        uniform;
+            axis        z;
+            start       (35.5 1.5 0.5);
+            end         (35.5 1.5 39.5);
+            nPoints     40;
+        }
+
+        sampleZAxis_x35_y0
+        {
+            type        uniform;
+            axis        z;
+            start       (35.5 0.5 0.5);
+            end         (35.5 0.5 39.5);
+            nPoints     40;
+        }
+    );
+}
