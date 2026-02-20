@@ -1,0 +1,79 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 91b4ae8ce0447c74e83db2ff9bad71a7, type: 3}
+  m_Name: JetConfig
+  m_EditorClassIdentifier: 
+  mode: 0
+  physDomainSize:
+    x: 10
+    y: 5
+    z: 10
+  gridResX: 120
+  dt: 0.1
+  mu: 0.02
+  den: 1
+  Umax: 0.5
+  R:
+    x: 10
+    y: 10
+  jetCenter:
+    x: 25
+    y: 50
+  externalForce:
+    x: 0
+    y: 0
+    z: 0
+  inflowType: 1
+  velBoundCond: 0
+  presBoundCond: 0
+  solidType: 1
+  gridLayoutType: 1
+  convectionScheme: 0
+  fvmSolverType: 0
+  PISONumCorrectors: 2
+  velResidualCheckInterval: 10
+  velTolerance: 1e-15
+  velMaxNumIter: 50
+  presResidualCheckInterval: 20
+  presTolerance: 0.0001
+  presMaxNumIter: 400
+  colorMap: 0
+  showVelocityField: 1
+  showPressureField: 1
+  showFlagField: 1
+  ySlice: 25
+  minVel: 0
+  maxVel: 0.5
+  minPres: -0.5
+  maxPres: 0.5
+  cameraHeight: 150
+  cameraAngle: 60
+  showSimulationTime: 0
+  showDomainBoundary: 0
+  visScale: 1
+  physFieldOffset:
+    x: 0
+    y: 0
+    z: 0
+  attachFieldToModelBottom: 0
+  simulateGround: 0
+  showVoxelization: 0
+  slicePosSliderPos: {x: -350, y: 0}
+  slicePosSliderSize: {x: 20, y: 300}
+  timeSliderPos: {x: 0, y: 300}
+  timeSliderSize: {x: 300, y: 20}
+  saveVelField: 0
+  savePresField: 0
+  saveDirectory: D:/Projects/Unity/UnityProjects/TestWindNoiseSimulation/Data
+  saveInterval: 1000
+  readDirectory: D:/Projects/Unity/UnityProjects/TestWindNoiseSimulation/Data
+  readFileName: 

@@ -1,0 +1,491 @@
+// This file contains shaders that are no longer used (but still have reference values).
+#include "../../Includes/Constants.hlsl"
+
+#pragma kernel CSComputePredictedVel
+#pragma kernel CSComputePredictedVelFluxInterp
+#pragma kernel CSComputePredictedVelFluxInterpSolidBnd
+#pragma kernel CSSolvePresCorrection
+#pragma kernel CSNeumannPresBndCond
+#pragma kernel CSApplyVelCorrection
+
+RWTexture3D<float4> velField;
+RWTexture3D<float4> velFieldLastTime;
+RWTexture3D<float4> velFieldLastIter;
+
+RWTexture3D<float> presFieldLastTime;
+RWTexture3D<float> presCorrectField;
+RWTexture3D<float> presCorrectFieldLastIter;
+
+RWTexture3D<int> flagField; // 0 for fluid, 1 for solid
+
+RWTexture3D<float4> DField; // Diagonal terms of the velocity prediction coefficient matrix
+
+int3 gridRes;
+int3 velRes;
+int3 presRes;
+float dt;
+float dx;
+float ds;
+float dv;
+float nu;
+float den;
+float3 externalForce;
+float D;
+float DInv;
+float dirichletVelX;
+
+
+// Central difference schemes for face velocities
+float FaceUCds(RWTexture3D<float4> velField, int3 id1, int3 id2)
+{
+    return 0.5 * (velField[id1].x + velField[id2].x);
+}
+
+float FaceVCds(RWTexture3D<float4> velField, int3 id1, int3 id2)
+{
+    return 0.5 * (velField[id1].y + velField[id2].y);
+}
+
+float FaceWCds(RWTexture3D<float4> velField, int3 id1, int3 id2)
+{
+    return 0.5 * (velField[id1].z + velField[id2].z);
+}
+
+// ----- Return whether the cell with "id" is inside the simulation region -----
+bool InRegion(int3 id)
+{
+    return (id.x >= 0 && id.x < gridRes.x) && (id.y >= 0 && id.y < gridRes.y) && (id.z >= 0 && id.z < gridRes.z);
+}
+
+[numthreads(8, 8, 8)]
+void CSComputePredictedVel(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (x == 0 || x >= int(gridRes.x) - 1 || y == 0 || y >= int(gridRes.y) - 1 || z == 0 || z >= int(gridRes.z) - 1)
+        return;
+    
+    // Bugs to be fixed here.
+    float DUInv = 1.0 / (dv / dt + 0.25 * ds * (velFieldLastTime[int3(x + 1, y, z)].x - velFieldLastTime[int3(x - 1, y, z)].x) + 6 * nu * ds / dx);
+    float DVInv = 1.0 / (dv / dt + 0.25 * ds * (velFieldLastTime[int3(x, y + 1, z)].y - velFieldLastTime[int3(x, y - 1, z)].y) + 6 * nu * ds / dx);
+    float DWInv = 1.0 / (dv / dt + 0.25 * ds * (velFieldLastTime[int3(x, y, z + 1)].z - velFieldLastTime[int3(x, y, z - 1)].z) + 6 * nu * ds / dx);
+    
+    // U component
+    float UAdvectTerm = DUInv * ds * (0
+        - FaceUCds(velFieldLastTime, int3(x, y, z), int3(x + 1, y, z)) * 0.5 * velFieldLastIter[int3(x + 1, y, z)].x
+        + FaceUCds(velFieldLastTime, int3(x, y, z), int3(x - 1, y, z)) * 0.5 * velFieldLastIter[int3(x - 1, y, z)].x
+        - FaceUCds(velFieldLastTime, int3(x, y, z), int3(x, y + 1, z)) * FaceVCds(velFieldLastIter, int3(x, y, z), int3(x, y + 1, z))
+        + FaceUCds(velFieldLastTime, int3(x, y, z), int3(x, y - 1, z)) * FaceVCds(velFieldLastIter, int3(x, y, z), int3(x, y - 1, z))
+        - FaceUCds(velFieldLastTime, int3(x, y, z), int3(x, y, z + 1)) * FaceWCds(velFieldLastIter, int3(x, y, z), int3(x, y, z + 1))
+        + FaceUCds(velFieldLastTime, int3(x, y, z), int3(x, y, z - 1)) * FaceWCds(velFieldLastIter, int3(x, y, z), int3(x, y, z - 1)));
+    float UDiffTerm = DUInv * (nu * ds / dx) * (0
+        + velFieldLastIter[int3(x + 1, y, z)].x + velFieldLastIter[int3(x - 1, y, z)].x
+        + velFieldLastIter[int3(x, y + 1, z)].x + velFieldLastIter[int3(x, y - 1, z)].x
+        + velFieldLastIter[int3(x, y, z + 1)].x + velFieldLastIter[int3(x, y, z - 1)].x);
+    float UTimeTerm = DUInv * (dv / dt) * velFieldLastTime[int3(x, y, z)].x;
+    float UPresTerm = -DUInv * (ds / (2 * den)) * (presFieldLastTime[int3(x + 1, y, z)] - presFieldLastTime[int3(x - 1, y, z)]);
+    float UForceTerm = DUInv * dv * externalForce.x;
+    float U = UAdvectTerm + UDiffTerm + UTimeTerm + UPresTerm + UForceTerm;
+    
+    // V component
+    float VAdvectTerm = DVInv * ds * (0
+        - FaceVCds(velFieldLastTime, int3(x, y, z), int3(x + 1, y, z)) * FaceUCds(velFieldLastIter, int3(x, y, z), int3(x + 1, y, z))
+        + FaceVCds(velFieldLastTime, int3(x, y, z), int3(x - 1, y, z)) * FaceUCds(velFieldLastIter, int3(x, y, z), int3(x - 1, y, z))
+        - FaceVCds(velFieldLastTime, int3(x, y, z), int3(x, y + 1, z)) * 0.5 * velFieldLastIter[int3(x, y + 1, z)].y
+        + FaceVCds(velFieldLastTime, int3(x, y, z), int3(x, y - 1, z)) * 0.5 * velFieldLastIter[int3(x, y - 1, z)].y
+        - FaceVCds(velFieldLastTime, int3(x, y, z), int3(x, y, z + 1)) * FaceWCds(velFieldLastIter, int3(x, y, z), int3(x, y, z + 1))
+        + FaceVCds(velFieldLastTime, int3(x, y, z), int3(x, y, z - 1)) * FaceWCds(velFieldLastIter, int3(x, y, z), int3(x, y, z - 1)));
+    float VDiffTerm = DVInv * (nu * ds / dx) * (0
+        + velFieldLastIter[int3(x + 1, y, z)].y + velFieldLastIter[int3(x - 1, y, z)].y
+        + velFieldLastIter[int3(x, y + 1, z)].y + velFieldLastIter[int3(x, y - 1, z)].y
+        + velFieldLastIter[int3(x, y, z + 1)].y + velFieldLastIter[int3(x, y, z - 1)].y);
+    float VTimeTerm = DVInv * (dv / dt) * velFieldLastTime[int3(x, y, z)].y;
+    float VPresTerm = -DVInv * (ds / (2 * den)) * (presFieldLastTime[int3(x, y + 1, z)] - presFieldLastTime[int3(x, y - 1, z)]);
+    float VForceTerm = DVInv * dv * externalForce.y;
+    float V = VAdvectTerm + VDiffTerm + VTimeTerm + VPresTerm + VForceTerm;
+    
+    float WAdvectTerm = DWInv * ds * (0
+        - FaceWCds(velFieldLastTime, int3(x, y, z), int3(x + 1, y, z)) * FaceUCds(velFieldLastIter, int3(x, y, z), int3(x + 1, y, z))
+        + FaceWCds(velFieldLastTime, int3(x, y, z), int3(x - 1, y, z)) * FaceUCds(velFieldLastIter, int3(x, y, z), int3(x - 1, y, z))
+        - FaceWCds(velFieldLastTime, int3(x, y, z), int3(x, y + 1, z)) * FaceVCds(velFieldLastIter, int3(x, y, z), int3(x, y + 1, z))
+        + FaceWCds(velFieldLastTime, int3(x, y, z), int3(x, y - 1, z)) * FaceVCds(velFieldLastIter, int3(x, y, z), int3(x, y - 1, z))
+        - FaceWCds(velFieldLastTime, int3(x, y, z), int3(x, y, z + 1)) * 0.5 * velFieldLastIter[int3(x, y, z + 1)].z
+        + FaceWCds(velFieldLastTime, int3(x, y, z), int3(x, y, z - 1)) * 0.5 * velFieldLastIter[int3(x, y, z - 1)].z);
+    float WDiffTerm = DWInv * (nu * ds / dx) * (0
+        + velFieldLastIter[int3(x + 1, y, z)].z + velFieldLastIter[int3(x - 1, y, z)].z
+        + velFieldLastIter[int3(x, y + 1, z)].z + velFieldLastIter[int3(x, y - 1, z)].z
+        + velFieldLastIter[int3(x, y, z + 1)].z + velFieldLastIter[int3(x, y, z - 1)].z);
+    float WTimeTerm = DWInv * (dv / dt) * velFieldLastTime[int3(x, y, z)].z;
+    float WPresTerm = -DWInv * (ds / (2 * den)) * (presFieldLastTime[int3(x, y, z + 1)] - presFieldLastTime[int3(x, y, z - 1)]);
+    float WForceTerm = DWInv * dv * externalForce.z;
+    float W = WAdvectTerm + WDiffTerm + WTimeTerm + WPresTerm + WForceTerm;
+    
+    velField[id] = float4(U, V, W, 0.0f);
+}
+
+// Deprecated function, kept for reference
+[numthreads(8, 8, 8)]
+void CSComputePredictedVelFluxInterp(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (x == 0 || x >= int(gridRes.x) - 1 || y == 0 || y >= int(gridRes.y) - 1 || z == 0 || z >= int(gridRes.z) - 1)
+        return;
+    
+    float predictedVelX = 1 / (dv / dt + 6 * nu * ds / dx) * (0
+        - (ds / 2 * velFieldLastTime[int3(x + 1, y, z)].x) * velFieldLastIter[int3(x + 1, y, z)].x
+        + (ds / 2 * velFieldLastTime[int3(x - 1, y, z)].x) * velFieldLastIter[int3(x - 1, y, z)].x
+        - (ds / 2 * velFieldLastTime[int3(x, y + 1, z)].x) * velFieldLastIter[int3(x, y + 1, z)].y
+        + (ds / 2 * velFieldLastTime[int3(x, y - 1, z)].x) * velFieldLastIter[int3(x, y - 1, z)].y
+        - (ds / 2 * velFieldLastTime[int3(x, y, z + 1)].x) * velFieldLastIter[int3(x, y, z + 1)].z
+        + (ds / 2 * velFieldLastTime[int3(x, y, z - 1)].x) * velFieldLastIter[int3(x, y, z - 1)].z
+        + (nu * ds / dx) * (
+        velFieldLastIter[int3(x + 1, y, z)].x + velFieldLastIter[int3(x - 1, y, z)].x +
+        velFieldLastIter[int3(x, y + 1, z)].x + velFieldLastIter[int3(x, y - 1, z)].x +
+        velFieldLastIter[int3(x, y, z + 1)].x + velFieldLastIter[int3(x, y, z - 1)].x)
+        + (dv / dt) * velFieldLastTime[int3(x, y, z)].x
+        - (ds / (2 * den)) * (presFieldLastTime[int3(x + 1, y, z)] - presFieldLastTime[int3(x - 1, y, z)])
+        + (externalForce.x * dv)
+        );
+    
+    float predictedVelY = 1 / (dv / dt + 6 * nu * ds / dx) * (0
+        - (ds / 2 * velFieldLastTime[int3(x + 1, y, z)].y) * velFieldLastIter[int3(x + 1, y, z)].x
+        + (ds / 2 * velFieldLastTime[int3(x - 1, y, z)].y) * velFieldLastIter[int3(x - 1, y, z)].x
+        - (ds / 2 * velFieldLastTime[int3(x, y + 1, z)].y) * velFieldLastIter[int3(x, y + 1, z)].y
+        + (ds / 2 * velFieldLastTime[int3(x, y - 1, z)].y) * velFieldLastIter[int3(x, y - 1, z)].y
+        - (ds / 2 * velFieldLastTime[int3(x, y, z + 1)].y) * velFieldLastIter[int3(x, y, z + 1)].z
+        + (ds / 2 * velFieldLastTime[int3(x, y, z - 1)].y) * velFieldLastIter[int3(x, y, z - 1)].z
+        + (nu * ds / dx) * (
+        velFieldLastIter[int3(x + 1, y, z)].y + velFieldLastIter[int3(x - 1, y, z)].y +
+        velFieldLastIter[int3(x, y + 1, z)].y + velFieldLastIter[int3(x, y - 1, z)].y +
+        velFieldLastIter[int3(x, y, z + 1)].y + velFieldLastIter[int3(x, y, z - 1)].y)
+        + (dv / dt) * velFieldLastTime[int3(x, y, z)].y
+        - (ds / (2 * den)) * (presFieldLastTime[int3(x, y + 1, z)] - presFieldLastTime[int3(x, y - 1, z)])
+        + (externalForce.y * dv)
+        );
+    
+    float predictedVelZ = 1 / (dv / dt + 6 * nu * ds / dx) * (0
+        - (ds / 2 * velFieldLastTime[int3(x + 1, y, z)].z) * velFieldLastIter[int3(x + 1, y, z)].x
+        + (ds / 2 * velFieldLastTime[int3(x - 1, y, z)].z) * velFieldLastIter[int3(x - 1, y, z)].x
+        - (ds / 2 * velFieldLastTime[int3(x, y + 1, z)].z) * velFieldLastIter[int3(x, y + 1, z)].y
+        + (ds / 2 * velFieldLastTime[int3(x, y - 1, z)].z) * velFieldLastIter[int3(x, y - 1, z)].y
+        - (ds / 2 * velFieldLastTime[int3(x, y, z + 1)].z) * velFieldLastIter[int3(x, y, z + 1)].z
+        + (ds / 2 * velFieldLastTime[int3(x, y, z - 1)].z) * velFieldLastIter[int3(x, y, z - 1)].z
+        + (nu * ds / dx) * (
+        velFieldLastIter[int3(x + 1, y, z)].z + velFieldLastIter[int3(x - 1, y, z)].z +
+        velFieldLastIter[int3(x, y + 1, z)].z + velFieldLastIter[int3(x, y - 1, z)].z +
+        velFieldLastIter[int3(x, y, z + 1)].z + velFieldLastIter[int3(x, y, z - 1)].z)
+        + (dv / dt) * velFieldLastTime[int3(x, y, z)].z
+        - (ds / (2 * den)) * (presFieldLastTime[int3(x, y, z + 1)] - presFieldLastTime[int3(x, y, z - 1)])
+        + (externalForce.z * dv)
+        );
+    
+    velField[id] = float4(predictedVelX, predictedVelY, predictedVelZ, 0.0f);
+}
+
+[numthreads(8, 8, 8)]
+void CSComputePredictedVelFluxInterpSolidBnd(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (x == 0 || x >= gridRes.x - 1 || y == 0 || y >= gridRes.y - 1 || z == 0 || z >= gridRes.z - 1)
+        return;
+    
+    if (flagField[int3(x, y, z)] != CELL_FLUID)
+        return;
+    
+    float Dx = dv / dt, Dy = dv / dt, Dz = dv / dt;
+    
+    float UAdvectTerm = 0, UPresTerm = 0, UDiffTerm = 0, UTimeTerm = 0, UForceTerm = 0;
+    float VAdvectTerm = 0, VPresTerm = 0, VDiffTerm = 0, VTimeTerm = 0, VForceTerm = 0;
+    float WAdvectTerm = 0, WPresTerm = 0, WDiffTerm = 0, WTimeTerm = 0, WForceTerm = 0;
+    
+    int3 P = int3(x, y, z);
+    int3 E = int3(x + 1, y, z);
+    int3 W = int3(x - 1, y, z);
+    int3 N = int3(x, y + 1, z);
+    int3 S = int3(x, y - 1, z);
+    int3 U = int3(x, y, z + 1);
+    int3 D = int3(x, y, z - 1);
+    
+    // Calculate the advection term.
+    if (flagField[E] == CELL_FLUID)
+    {
+        UAdvectTerm -= ds * 0.5 * (velFieldLastTime[E].x * velFieldLastIter[E].x);
+        VAdvectTerm -= ds * 0.5 * (velFieldLastTime[E].y * velFieldLastIter[E].x + velFieldLastTime[P].y * velFieldLastIter[P].x);
+        WAdvectTerm -= ds * 0.5 * (velFieldLastTime[E].z * velFieldLastIter[E].x + velFieldLastTime[P].z * velFieldLastIter[P].x);
+        Dx += ds * 0.5 * velFieldLastTime[P].x;
+    }
+    if (flagField[W] == CELL_FLUID)
+    {
+        UAdvectTerm += ds * 0.5 * (velFieldLastTime[W].x * velFieldLastIter[W].x);
+        VAdvectTerm += ds * 0.5 * (velFieldLastTime[W].y * velFieldLastIter[W].x + velFieldLastTime[P].y * velFieldLastIter[P].x);
+        WAdvectTerm += ds * 0.5 * (velFieldLastTime[W].z * velFieldLastIter[W].x + velFieldLastTime[P].z * velFieldLastIter[P].x);
+        Dx -= ds * 0.5 * velFieldLastTime[P].x;
+    }
+    if (flagField[N] == CELL_FLUID)
+    {
+        UAdvectTerm -= ds * 0.5 * (velFieldLastTime[N].x * velFieldLastIter[N].y + velFieldLastTime[P].x * velFieldLastIter[P].y);
+        VAdvectTerm -= ds * 0.5 * (velFieldLastTime[N].y * velFieldLastIter[N].y);
+        WAdvectTerm -= ds * 0.5 * (velFieldLastTime[N].z * velFieldLastIter[N].y + velFieldLastTime[P].z * velFieldLastIter[P].y);
+        Dy += ds * 0.5 * velFieldLastTime[P].y;
+    }
+    if (flagField[S] == CELL_FLUID)
+    {
+        UAdvectTerm += ds * 0.5 * (velFieldLastTime[S].x * velFieldLastIter[S].y + velFieldLastTime[P].x * velFieldLastIter[P].y);
+        VAdvectTerm += ds * 0.5 * (velFieldLastTime[S].y * velFieldLastIter[S].y);
+        WAdvectTerm += ds * 0.5 * (velFieldLastTime[S].z * velFieldLastIter[S].y + velFieldLastTime[P].z * velFieldLastIter[P].y);
+        Dy -= ds * 0.5 * velFieldLastTime[P].y;
+    }
+    if (flagField[U] == CELL_FLUID)
+    {
+        UAdvectTerm -= ds * 0.5 * (velFieldLastTime[U].x * velFieldLastIter[U].z + velFieldLastTime[P].x * velFieldLastIter[P].z);
+        VAdvectTerm -= ds * 0.5 * (velFieldLastTime[U].y * velFieldLastIter[U].z + velFieldLastTime[P].y * velFieldLastIter[P].z);
+        WAdvectTerm -= ds * 0.5 * (velFieldLastTime[U].z * velFieldLastIter[U].z);
+        Dz += ds * 0.5 * velFieldLastTime[P].z;
+    }
+    if (flagField[D] == CELL_FLUID)
+    {
+        UAdvectTerm += ds * 0.5 * (velFieldLastTime[D].x * velFieldLastIter[D].z + velFieldLastTime[P].x * velFieldLastIter[P].z);
+        VAdvectTerm += ds * 0.5 * (velFieldLastTime[D].y * velFieldLastIter[D].z + velFieldLastTime[P].y * velFieldLastIter[P].z);
+        WAdvectTerm += ds * 0.5 * (velFieldLastTime[D].z * velFieldLastIter[D].z);
+        Dz -= ds * 0.5 * velFieldLastTime[P].z;
+    }
+    
+    // Calculate the pressure term.
+    float presEFace = 0, presWFace = 0, presNFace = 0, presSFace = 0, presUFace = 0, presDFace = 0;
+        
+    if (flagField[E] == CELL_FLUID)
+        presEFace = 0.5 * (presFieldLastTime[P] + presFieldLastTime[E]);
+    else
+        presEFace = presFieldLastTime[P];
+    
+    if (flagField[W] == CELL_FLUID)
+        presWFace = 0.5 * (presFieldLastTime[P] + presFieldLastTime[W]);
+    else
+        presWFace = presFieldLastTime[P];
+    
+    if (flagField[N] == CELL_FLUID)
+        presNFace = 0.5 * (presFieldLastTime[P] + presFieldLastTime[N]);
+    else
+        presNFace = presFieldLastTime[P];
+    
+    if (flagField[S] == CELL_FLUID)
+        presSFace = 0.5 * (presFieldLastTime[P] + presFieldLastTime[S]);
+    else
+        presSFace = presFieldLastTime[P];
+    
+    if (flagField[U] == CELL_FLUID)
+        presUFace = 0.5 * (presFieldLastTime[P] + presFieldLastTime[U]);
+    else
+        presUFace = presFieldLastTime[P];
+    
+    if (flagField[D] == CELL_FLUID)
+        presDFace = 0.5 * (presFieldLastTime[P] + presFieldLastTime[D]);
+    else
+        presDFace = presFieldLastTime[P];
+    
+    UPresTerm = -(1.0 / den) * ds * (presEFace - presWFace);
+    VPresTerm = -(1.0 / den) * ds * (presNFace - presSFace);
+    WPresTerm = -(1.0 / den) * ds * (presUFace - presDFace);
+    
+    // Calculate the diffusion term for U component
+    if (flagField[E] == CELL_FLUID)
+    {
+        UDiffTerm += nu * ds / dx * velFieldLastIter[E].x;
+        VDiffTerm += nu * ds / dx * velFieldLastIter[E].y;
+        WDiffTerm += nu * ds / dx * velFieldLastIter[E].z;
+        Dx += nu * ds / dx;
+        Dy += nu * ds / dx;
+        Dz += nu * ds / dx;
+    }
+    else
+    {
+        Dx += 2 * nu * ds / dx;
+        Dy += 2 * nu * ds / dx;
+        Dz += 2 * nu * ds / dx;
+    }
+    if (flagField[W] == CELL_FLUID)
+    {
+        UDiffTerm += nu * ds / dx * velFieldLastIter[W].x;
+        VDiffTerm += nu * ds / dx * velFieldLastIter[W].y;
+        WDiffTerm += nu * ds / dx * velFieldLastIter[W].z;
+        Dx += nu * ds / dx;
+        Dy += nu * ds / dx;
+        Dz += nu * ds / dx;
+    }
+    else
+    {
+        Dx += 2 * nu * ds / dx;
+        Dy += 2 * nu * ds / dx;
+        Dz += 2 * nu * ds / dx;
+    }
+    if (flagField[N] == CELL_FLUID)
+    {
+        UDiffTerm += nu * ds / dx * velFieldLastIter[N].x;
+        VDiffTerm += nu * ds / dx * velFieldLastIter[N].y;
+        WDiffTerm += nu * ds / dx * velFieldLastIter[N].z;
+        Dx += nu * ds / dx;
+        Dy += nu * ds / dx;
+        Dz += nu * ds / dx;
+    }
+    else
+    {
+        Dx += 2 * nu * ds / dx;
+        Dy += 2 * nu * ds / dx;
+        Dz += 2 * nu * ds / dx;
+    }
+    if (flagField[S] == CELL_FLUID)
+    {
+        UDiffTerm += nu * ds / dx * velFieldLastIter[S].x;
+        VDiffTerm += nu * ds / dx * velFieldLastIter[S].y;
+        WDiffTerm += nu * ds / dx * velFieldLastIter[S].z;
+        Dx += nu * ds / dx;
+        Dy += nu * ds / dx;
+        Dz += nu * ds / dx;
+    }
+    else
+    {
+        Dx += 2 * nu * ds / dx;
+        Dy += 2 * nu * ds / dx;
+        Dz += 2 * nu * ds / dx;
+    }
+    if (flagField[U] == CELL_FLUID)
+    {
+        UDiffTerm += nu * ds / dx * velFieldLastIter[U].x;
+        VDiffTerm += nu * ds / dx * velFieldLastIter[U].y;
+        WDiffTerm += nu * ds / dx * velFieldLastIter[U].z;
+        Dx += nu * ds / dx;
+        Dy += nu * ds / dx;
+        Dz += nu * ds / dx;
+    }
+    else
+    {
+        Dx += 2 * nu * ds / dx;
+        Dy += 2 * nu * ds / dx;
+        Dz += 2 * nu * ds / dx;
+    }
+    if (flagField[D] == CELL_FLUID)
+    {
+        UDiffTerm += nu * ds / dx * velFieldLastIter[D].x;
+        VDiffTerm += nu * ds / dx * velFieldLastIter[D].y;
+        WDiffTerm += nu * ds / dx * velFieldLastIter[D].z;
+        Dx += nu * ds / dx;
+        Dy += nu * ds / dx;
+        Dz += nu * ds / dx;
+    }
+    else
+    {
+        Dx += 2 * nu * ds / dx;
+        Dy += 2 * nu * ds / dx;
+        Dz += 2 * nu * ds / dx;
+    }
+    
+    // Calculate the time term.
+    UTimeTerm = dv / dt * velFieldLastTime[P].x;
+    VTimeTerm = dv / dt * velFieldLastTime[P].y;
+    WTimeTerm = dv / dt * velFieldLastTime[P].z;
+    
+    // Calculate the force term.
+    UForceTerm = dv * externalForce.x;
+    VForceTerm = dv * externalForce.y;
+    WForceTerm = dv * externalForce.z;
+    
+    // Calculate the final predicted velocities.
+    float predictedVelX = 1.0 / Dx * (UAdvectTerm + UPresTerm + UDiffTerm + UTimeTerm + UForceTerm);
+    float predictedVelY = 1.0 / Dy * (VAdvectTerm + VPresTerm + VDiffTerm + VTimeTerm + VForceTerm);
+    float predictedVelZ = 1.0 / Dz * (WAdvectTerm + WPresTerm + WDiffTerm + WTimeTerm + WForceTerm);
+    
+    velField[id] = float4(predictedVelX, predictedVelY, predictedVelZ, 0.0f);
+    
+    // Store the diagonal terms for pressure correction.
+    DField[id] = float4(Dx, Dy, Dz, 0.0f);
+}
+
+[numthreads(8, 8, 8)]
+void CSSolvePresCorrection(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (x == 0 || x >= int(gridRes.x) - 1 || y == 0 || y >= int(gridRes.y) - 1 || z == 0 || z >= int(gridRes.z) - 1)
+        return;
+
+    // Solve the continuity equation to obtain pressure correction.
+    presCorrectField[id] = (dx / 6) * (-D / 2 * (0
+        + velField[int3(x + 1, y, z)].x - velField[int3(x - 1, y, z)].x
+        + velField[int3(x, y + 1, z)].y - velField[int3(x, y - 1, z)].y
+        + velField[int3(x, y, z + 1)].z - velField[int3(x, y, z - 1)].z)
+        + 1 / dx * (0
+        + presCorrectFieldLastIter[int3(x + 1, y, z)] + presCorrectFieldLastIter[int3(x - 1, y, z)]
+        + presCorrectFieldLastIter[int3(x, y + 1, z)] + presCorrectFieldLastIter[int3(x, y - 1, z)]
+        + presCorrectFieldLastIter[int3(x, y, z + 1)] + presCorrectFieldLastIter[int3(x, y, z - 1)])
+        );
+}
+
+[numthreads(8, 8, 8)]
+void CSNeumannPresBndCond(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (x >= int(gridRes.x) || y >= int(gridRes.y) || z >= int(gridRes.z))
+        return;
+    
+    bool isBoundary = (x == 0 || x == gridRes.x - 1 || y == 0 || y == gridRes.y - 1 || z == 0 || z == gridRes.z - 1);
+    if (!isBoundary)
+        return;
+    
+    int dx = (x == 0) ? 1 : (x == gridRes.x - 1) ? -1 : 0;
+    int dy = (y == 0) ? 1 : (y == gridRes.y - 1) ? -1 : 0;
+    int dz = (z == 0) ? 1 : (z == gridRes.z - 1) ? -1 : 0;
+    
+    presCorrectField[id] = presCorrectField[int3(x + dx, y + dy, z + dz)];
+}
+
+[numthreads(8, 8, 8)]
+void CSApplyVelCorrection(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (x >= int(gridRes.x) || y >= int(gridRes.y) || z >= int(gridRes.z))
+        return;
+    
+    float velXCorrect = -DInv * (presCorrectField[int3(x + 1, y, z)] - presCorrectField[int3(x - 1, y, z)]) / (2 * dx);
+    float velYCorrect = -DInv * (presCorrectField[int3(x, y + 1, z)] - presCorrectField[int3(x, y - 1, z)]) / (2 * dx);
+    float velZCorrect = -DInv * (presCorrectField[int3(x, y, z + 1)] - presCorrectField[int3(x, y, z - 1)]) / (2 * dx);
+    
+    velField[id] += float4(velXCorrect, velYCorrect, velZCorrect, 0.0f);
+}
+
+[numthreads(8, 8, 8)]
+void CSApplyVelCorrection2(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (x >= int(gridRes.x) || y >= int(gridRes.y) || z >= int(gridRes.z))
+        return;
+    
+    int3 P = int3(x, y, z);
+    int3 E = int3(x + 1, y, z);
+    int3 W = int3(x - 1, y, z);
+    int3 N = int3(x, y + 1, z);
+    int3 S = int3(x, y - 1, z);
+    int3 U = int3(x, y, z + 1);
+    int3 D = int3(x, y, z - 1);
+    
+    float velXCorrect = 0, velYCorrect = 0, velZCorrect = 0;
+    
+    if (InRegion(E) && InRegion(W))
+    {
+        velXCorrect = -DInv * (presCorrectField[E] - presCorrectField[W]) / (2 * dx);
+    }
+    if (InRegion(N) && InRegion(S))
+    {
+        velYCorrect = -DInv * (presCorrectField[N] - presCorrectField[S]) / (2 * dx);
+    }
+    if (InRegion(U) && InRegion(D))
+    {
+        velZCorrect = -DInv * (presCorrectField[U] - presCorrectField[D]) / (2 * dx);
+    }
+    
+    velField[id] += float4(velXCorrect, velYCorrect, velZCorrect, 0.0f);
+}

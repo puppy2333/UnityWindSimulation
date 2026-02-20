@@ -1,0 +1,82 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 91b4ae8ce0447c74e83db2ff9bad71a7, type: 3}
+  m_Name: JetSmallBuilding3ConfigSaveAndLoad
+  m_EditorClassIdentifier: 
+  mode: 2
+  physDomainSize:
+    x: 40
+    y: 20
+    z: 40
+  gridResX: 100
+  dt: 0.1
+  mu: 0.03
+  den: 1
+  Umax: 0.8
+  R:
+    x: 15
+    y: 40
+  jetCenter:
+    x: 17
+    y: 50
+  externalForce:
+    x: 0
+    y: 0
+    z: 0
+  inflowType: 1
+  velBoundCond: 0
+  presBoundCond: 0
+  solidType: 2
+  gridLayoutType: 1
+  convectionScheme: 0
+  faceVelInterpScheme: 0
+  fvmSolverType: 0
+  PISONumCorrectors: 2
+  velResidualCheckInterval: 10
+  velTolerance: 1e-15
+  velMaxNumIter: 50
+  presResidualCheckInterval: 20
+  presTolerance: 0.001
+  presMaxNumIter: 400
+  colorMap: 0
+  showVelocityField: 1
+  showPressureField: 1
+  showFlagField: 1
+  ySlice: 25
+  minVel: 0
+  maxVel: 1
+  minPres: -0.75
+  maxPres: 0.75
+  cameraHeight: 100
+  cameraAngle: 60
+  showSimulationTime: 0
+  showDomainBoundary: 0
+  visScale: 1
+  visInterpolateType: 0
+  physFieldOffset:
+    x: 10
+    y: 0
+    z: 0
+  attachFieldToModelBottom: 0
+  simulateGround: 0
+  showVoxelization: 0
+  slicePosSliderPos: {x: -350, y: 0}
+  slicePosSliderSize: {x: 20, y: 300}
+  timeSliderPos: {x: 0, y: 300}
+  timeSliderSize: {x: 300, y: 20}
+  saveVelField: 0
+  savePresField: 0
+  saveDirectory: D:/Projects/Unity/UnityProjects/TestWindNoiseSimulation/Data
+  saveInterval: 100
+  flagFileName: SmallBuilding3
+  readDirectory: D:/Projects/Unity/UnityProjects/TestWindNoiseSimulation/Data
+  readFileName: Field_20250908_114650_stag.nc

@@ -1,0 +1,3199 @@
+#include "../Includes/Constants.hlsl"
+
+// Each #kernel tells which function to compile; you can have many kernels
+// ----- SIMPLE -----
+#pragma kernel CSComputePredictedVel
+#pragma kernel CSComputePredictedVelLES
+#pragma kernel CSSolvePresCorrection
+#pragma kernel CSSolvePresCorrectionRhieChow
+#pragma kernel CSApplyPresCorrection
+#pragma kernel CSPresNormalization
+#pragma kernel CSApplyVelCorrection
+#pragma kernel CSApplyVelCorrectionDivergenceTheorem
+// ----- SIMPLE (accelerated) -----
+#pragma kernel CSVelPredictPreCompute
+#pragma kernel CSVelPredict
+#pragma kernel CSPresCorrectRhieChowPreCompute
+#pragma kernel CSPresCorrectRhieChow
+// ----- Residual calculation -----
+#pragma kernel CSComputeVelPredictResidual
+#pragma kernel CSComputePresCorrectResidual
+
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWTexture3D<float4> velField;
+RWTexture3D<float4> velFieldLastTime;
+RWTexture3D<float4> velFieldLastIter;
+RWTexture3D<float4> velCorrectField;
+
+RWTexture3D<float> presFieldLastTime;
+RWTexture3D<float> presCorrectField;
+RWTexture3D<float> presCorrectFieldLastIter;
+
+RWTexture3D<int> flagField; // 0 for fluid, 1 for solid
+
+// ----- Velocity prediction Buffers -----
+RWTexture3D<float4> DField;
+RWTexture3D<float4> bField;
+
+// ----- Pressure correction Buffers -----
+// Diagonal terms of pressure correction coefficient matrix, filled in pressure solver, used in 
+// residual calculation.
+RWTexture3D<float> DFieldPresCorrect;
+RWTexture3D<float> bFieldPresCorrect;
+
+// Buffer with size numGroupX * numGroupY * numGroupZ. Used to store the velocity / pressure 
+// matrix residual of each thread group.
+RWStructuredBuffer<float> gloResBuf;
+
+// Aod * U correction field for PISO.
+RWTexture3D<float4> AodUCorrectField;
+
+// ----- Boundary condition textures -----
+// float4: (velX, velY, velZ, unused)
+Texture2D<float4> bndFieldX0;
+Texture2D<float4> bndFieldXn;
+Texture2D<float4> bndFieldY0;
+Texture2D<float4> bndFieldYn;
+Texture2D<float4> bndFieldZ0;
+Texture2D<float4> bndFieldZn;
+
+int3 gridRes;
+int3 velRes;
+int3 presRes;
+float dt;
+float dx;
+float ds;
+float dv;
+float nu;
+float den;
+float3 externalForce;
+int3 numGroups;
+
+int velBndTypeX0;
+int velBndTypeXn;
+int velBndTypeY0;
+int velBndTypeYn;
+int velBndTypeZ0;
+int velBndTypeZn;
+
+int presBndTypeX0;
+int presBndTypeXn;
+int presBndTypeY0;
+int presBndTypeYn;
+int presBndTypeZ0;
+int presBndTypeZn;
+
+groupshared float groupResBuf[groupSize.x * groupSize.y * groupSize.z];
+
+// ----- LES (read-only) -----
+bool useLES;
+Texture3D<float> eddyVisField; // Eddy viscosity field at cell center
+Texture3D<float4> faceEddyVisField; // Eddy viscosity field at boundary faces
+
+// ----- Return whether the cell with "id" is inside the simulation region -----
+bool InRegion(int3 id)
+{
+    return (id.x >= 0 && id.x < gridRes.x) && (id.y >= 0 && id.y < gridRes.y) && (id.z >= 0 && id.z < gridRes.z);
+}
+
+bool IsFluid(int3 id)
+{
+    return flagField[id] == CELL_FLUID;
+}
+
+bool InRegionAndIsFluid(int3 id)
+{
+    if (InRegion(id))
+        return flagField[id] == CELL_FLUID;
+    else
+        return false;
+}
+
+bool InRegionAndIsSolid(int3 id)
+{
+    if (InRegion(id))
+        return flagField[id] == CELL_SOLID;
+    else
+        return false;
+}
+
+int GetCellIdx(int3 id)
+{
+    return id.z * gridRes.y * gridRes.x + id.y * gridRes.x + id.x;
+
+}
+
+// Kernel that interpolates velocity instead of flux in advection term.
+[numthreads(8, 8, 8)]
+void CSComputePredictedVel(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (!InRegion(id))
+        return;
+    
+    if (flagField[int3(x, y, z)] != CELL_FLUID)
+        return;
+    
+    float Dx = dv / dt, Dy = dv / dt, Dz = dv / dt;
+    
+    float UAdvectTerm = 0, UPresTerm = 0, UDiffTerm = 0, UConstTerm = 0;
+    float VAdvectTerm = 0, VPresTerm = 0, VDiffTerm = 0, VConstTerm = 0;
+    float WAdvectTerm = 0, WPresTerm = 0, WDiffTerm = 0, WConstTerm = 0;
+    
+    int3 P = int3(x, y, z);
+    int3 E = int3(x + 1, y, z);
+    int3 W = int3(x - 1, y, z);
+    int3 N = int3(x, y + 1, z);
+    int3 S = int3(x, y - 1, z);
+    int3 U = int3(x, y, z + 1);
+    int3 D = int3(x, y, z - 1);
+    
+    // ----- Advection term -----
+    // Central difference scheme is used to calculate face velocity. 
+    // U term: ue' * ue
+    // V term: ve' * ue
+    // W term: we' * ue
+    // ue' is step being solved, ue is the last iteration.
+    // Discretize: ue' * ue = 0.5 * (uP' + uE') * 0.5 * (uP + uE)
+    // Ad (coefficient of uP) = 0.25 * (uP' + uE')
+    // Aod (non-diagonal terms) = 0.25 * uE * (uP' + uE'), or negative if moved to RHS (in 
+    // Jacobian)
+    if (InRegion(E))
+    {
+        if (IsFluid(E))
+        {
+            UAdvectTerm -= ds * 0.25 * velFieldLastIter[E].x * (velFieldLastTime[P].x + velFieldLastTime[E].x);
+            VAdvectTerm -= ds * 0.25 * velFieldLastIter[E].y * (velFieldLastTime[P].x + velFieldLastTime[E].x);
+            WAdvectTerm -= ds * 0.25 * velFieldLastIter[E].z * (velFieldLastTime[P].x + velFieldLastTime[E].x);
+            Dx += ds * 0.25 * (velFieldLastTime[P].x + velFieldLastTime[E].x);
+            Dy += ds * 0.25 * (velFieldLastTime[P].x + velFieldLastTime[E].x);
+            Dz += ds * 0.25 * (velFieldLastTime[P].x + velFieldLastTime[E].x);
+        }
+        // Solid cell does not need explicit treatment.
+    }
+    else
+    {
+        if (velBndTypeXn == VEL_BND_FIXED_VALUE)
+        {
+            UConstTerm -= ds * bndFieldXn[int2(y, z)].x * bndFieldXn[int2(y, z)].x;
+            VConstTerm -= ds * bndFieldXn[int2(y, z)].y * bndFieldXn[int2(y, z)].x;
+            WConstTerm -= ds * bndFieldXn[int2(y, z)].z * bndFieldXn[int2(y, z)].x;
+        }
+        else if (velBndTypeXn == VEL_BND_ZERO_GRAD)
+        {
+            Dx += ds * velFieldLastTime[P].x;
+            Dy += ds * velFieldLastTime[P].x;
+            Dz += ds * velFieldLastTime[P].x;
+        }
+        // Symmetry boundary does not need explicit treatment.
+    }
+    
+    // uw' * uw, vw' * uw, vw' * uw
+    if (InRegion(W))
+    {
+        if (IsFluid(W))
+        {
+            UAdvectTerm += ds * 0.25 * velFieldLastIter[W].x * (velFieldLastTime[P].x + velFieldLastTime[W].x);
+            VAdvectTerm += ds * 0.25 * velFieldLastIter[W].y * (velFieldLastTime[P].x + velFieldLastTime[W].x);
+            WAdvectTerm += ds * 0.25 * velFieldLastIter[W].z * (velFieldLastTime[P].x + velFieldLastTime[W].x);
+            Dx -= ds * 0.25 * (velFieldLastTime[P].x + velFieldLastTime[W].x);
+            Dy -= ds * 0.25 * (velFieldLastTime[P].x + velFieldLastTime[W].x);
+            Dz -= ds * 0.25 * (velFieldLastTime[P].x + velFieldLastTime[W].x);
+        }
+        // Solid cell does not need explicit treatment.
+    }
+    else
+    {
+        if (velBndTypeX0 == VEL_BND_FIXED_VALUE)
+        {
+            UConstTerm += ds * bndFieldX0[int2(y, z)].x * bndFieldX0[int2(y, z)].x;
+            VConstTerm += ds * bndFieldX0[int2(y, z)].y * bndFieldX0[int2(y, z)].x;
+            WConstTerm += ds * bndFieldX0[int2(y, z)].z * bndFieldX0[int2(y, z)].x;
+        }
+        else if (velBndTypeX0 == VEL_BND_ZERO_GRAD)
+        {
+            Dx -= ds * velFieldLastTime[P].x;
+            Dy -= ds * velFieldLastTime[P].x;
+            Dz -= ds * velFieldLastTime[P].x;
+        }
+        // Symmetry boundary does not need explicit treatment.
+    }
+    
+    // un' * vn, vn' * vn, wn' * vn
+    if (InRegion(N))
+    {
+        if (IsFluid(N))
+        {
+            UAdvectTerm -= ds * 0.25 * velFieldLastIter[N].x * (velFieldLastTime[P].y + velFieldLastTime[N].y);
+            VAdvectTerm -= ds * 0.25 * velFieldLastIter[N].y * (velFieldLastTime[P].y + velFieldLastTime[N].y);
+            WAdvectTerm -= ds * 0.25 * velFieldLastIter[N].z * (velFieldLastTime[P].y + velFieldLastTime[N].y);
+            Dx += ds * 0.25 * (velFieldLastTime[P].y + velFieldLastTime[N].y);
+            Dy += ds * 0.25 * (velFieldLastTime[P].y + velFieldLastTime[N].y);
+            Dz += ds * 0.25 * (velFieldLastTime[P].y + velFieldLastTime[N].y);
+        }
+        // Solid cell does not need explicit treatment.
+    }
+    else
+    {
+        if (velBndTypeYn == VEL_BND_FIXED_VALUE)
+        {
+            UConstTerm -= ds * bndFieldYn[int2(x, z)].x * bndFieldYn[int2(x, z)].y;
+            VConstTerm -= ds * bndFieldYn[int2(x, z)].y * bndFieldYn[int2(x, z)].y;
+            WConstTerm -= ds * bndFieldYn[int2(x, z)].z * bndFieldYn[int2(x, z)].y;
+        }
+        else if (velBndTypeYn == VEL_BND_ZERO_GRAD)
+        {
+            Dx += ds * velFieldLastTime[P].y;
+            Dy += ds * velFieldLastTime[P].y;
+            Dz += ds * velFieldLastTime[P].y;
+        }
+        // Symmetry boundary does not need explicit treatment.
+    }
+    
+    // us' * vs, vs' * vs, ws' * vs
+    if (InRegion(S))
+    {
+        if (IsFluid(S))
+        {
+            UAdvectTerm += ds * 0.25 * velFieldLastIter[S].x * (velFieldLastTime[P].y + velFieldLastTime[S].y);
+            VAdvectTerm += ds * 0.25 * velFieldLastIter[S].y * (velFieldLastTime[P].y + velFieldLastTime[S].y);
+            WAdvectTerm += ds * 0.25 * velFieldLastIter[S].z * (velFieldLastTime[P].y + velFieldLastTime[S].y);
+            Dx -= ds * 0.25 * (velFieldLastTime[P].y + velFieldLastTime[S].y);
+            Dy -= ds * 0.25 * (velFieldLastTime[P].y + velFieldLastTime[S].y);
+            Dz -= ds * 0.25 * (velFieldLastTime[P].y + velFieldLastTime[S].y);
+        }
+        // Solid cell does not need explicit treatment.
+    }
+    else
+    {
+        if (velBndTypeY0 == VEL_BND_FIXED_VALUE)
+        {
+            UConstTerm += ds * bndFieldY0[int2(x, z)].x * bndFieldY0[int2(x, z)].y;
+            VConstTerm += ds * bndFieldY0[int2(x, z)].y * bndFieldY0[int2(x, z)].y;
+            WConstTerm += ds * bndFieldY0[int2(x, z)].z * bndFieldY0[int2(x, z)].y;
+        }
+        else if (velBndTypeY0 == VEL_BND_ZERO_GRAD)
+        {
+            Dx -= ds * velFieldLastTime[P].y;
+            Dy -= ds * velFieldLastTime[P].y;
+            Dz -= ds * velFieldLastTime[P].y;
+        }
+        // Symmetry boundary does not need explicit treatment.
+    }
+    
+    // uu' * wu, vu' * wu, wu' * wu
+    if (InRegion(U))
+    {
+        if (IsFluid(U))
+        {
+            UAdvectTerm -= ds * 0.25 * velFieldLastIter[U].x * (velFieldLastTime[P].z + velFieldLastTime[U].z);
+            VAdvectTerm -= ds * 0.25 * velFieldLastIter[U].y * (velFieldLastTime[P].z + velFieldLastTime[U].z);
+            WAdvectTerm -= ds * 0.25 * velFieldLastIter[U].z * (velFieldLastTime[P].z + velFieldLastTime[U].z);
+            Dx += ds * 0.25 * (velFieldLastTime[P].z + velFieldLastTime[U].z);
+            Dy += ds * 0.25 * (velFieldLastTime[P].z + velFieldLastTime[U].z);
+            Dz += ds * 0.25 * (velFieldLastTime[P].z + velFieldLastTime[U].z);
+        }
+        // Solid cell does not need explicit treatment.
+    }
+    else
+    {
+        if (velBndTypeZn == VEL_BND_FIXED_VALUE)
+        {
+            UConstTerm -= ds * bndFieldZn[int2(x, y)].x * bndFieldZn[int2(x, y)].z;
+            VConstTerm -= ds * bndFieldZn[int2(x, y)].y * bndFieldZn[int2(x, y)].z;
+            WConstTerm -= ds * bndFieldZn[int2(x, y)].z * bndFieldZn[int2(x, y)].z;
+        }
+        else if (velBndTypeZn == VEL_BND_ZERO_GRAD)
+        {
+            Dx += ds * velFieldLastTime[P].z;
+            Dy += ds * velFieldLastTime[P].z;
+            Dz += ds * velFieldLastTime[P].z;
+        }
+        // Symmetry boundary does not need explicit treatment.
+    }
+    
+    // ud' * wd, vd' * wd, wd' * wd
+    if (InRegion(D))
+    {
+        if (IsFluid(D))
+        {
+            UAdvectTerm += ds * 0.25 * velFieldLastIter[D].x * (velFieldLastTime[P].z + velFieldLastTime[D].z);
+            VAdvectTerm += ds * 0.25 * velFieldLastIter[D].y * (velFieldLastTime[P].z + velFieldLastTime[D].z);
+            WAdvectTerm += ds * 0.25 * velFieldLastIter[D].z * (velFieldLastTime[P].z + velFieldLastTime[D].z);
+            Dx -= ds * 0.25 * (velFieldLastTime[P].z + velFieldLastTime[D].z);
+            Dy -= ds * 0.25 * (velFieldLastTime[P].z + velFieldLastTime[D].z);
+            Dz -= ds * 0.25 * (velFieldLastTime[P].z + velFieldLastTime[D].z);
+        }
+        // Solid cell does not need explicit treatment.
+    }
+    else
+    {
+        if (velBndTypeZ0 == VEL_BND_FIXED_VALUE)
+        {
+            UConstTerm += ds * bndFieldZ0[int2(x, y)].x * bndFieldZ0[int2(x, y)].z;
+            VConstTerm += ds * bndFieldZ0[int2(x, y)].y * bndFieldZ0[int2(x, y)].z;
+            WConstTerm += ds * bndFieldZ0[int2(x, y)].z * bndFieldZ0[int2(x, y)].z;
+        }
+        else if (velBndTypeZ0 == VEL_BND_ZERO_GRAD)
+        {
+            Dx -= ds * velFieldLastTime[P].z;
+            Dy -= ds * velFieldLastTime[P].z;
+            Dz -= ds * velFieldLastTime[P].z;
+        }
+        // Symmetry boundary does not need explicit treatment.
+    }
+    
+    // ----- Pressure term -----
+    float presEFace = 0, presWFace = 0, presNFace = 0, presSFace = 0, presUFace = 0, presDFace = 0;
+    
+    if (InRegion(E))
+    {
+        if (IsFluid(E))
+            presEFace = 0.5 * (presFieldLastTime[P] + presFieldLastTime[E]);
+        else
+            presEFace = presFieldLastTime[P];
+    }
+    else
+    {
+        if (presBndTypeXn == PRES_BND_FIXED_VALUE)
+            presEFace = 0;
+        else if (presBndTypeXn == PRES_BND_ZERO_GRAD)
+            presEFace = presFieldLastTime[P];
+        else if (presBndTypeXn == PRES_BND_SYMMETRY)
+            presEFace = presFieldLastTime[P];
+    }
+    
+    if (InRegion(W))
+    {
+        if (IsFluid(W))
+            presWFace = 0.5 * (presFieldLastTime[P] + presFieldLastTime[W]);
+        else
+            presWFace = presFieldLastTime[P];
+    }
+    else
+    {
+        if (presBndTypeX0 == PRES_BND_FIXED_VALUE)
+            presWFace = 0;
+        else if (presBndTypeX0 == PRES_BND_ZERO_GRAD)
+            presWFace = presFieldLastTime[P];
+        else if (presBndTypeX0 == PRES_BND_SYMMETRY)
+            presWFace = presFieldLastTime[P];
+    }
+    
+    if (InRegion(N))
+    {
+        if (IsFluid(N))
+            presNFace = 0.5 * (presFieldLastTime[P] + presFieldLastTime[N]);
+        else
+            presNFace = presFieldLastTime[P];
+    }
+    else
+    {
+        if (presBndTypeYn == PRES_BND_FIXED_VALUE)
+            presNFace = 0;
+        else if (presBndTypeYn == PRES_BND_ZERO_GRAD)
+            presNFace = presFieldLastTime[P];
+        else if (presBndTypeYn == PRES_BND_SYMMETRY)
+            presNFace = presFieldLastTime[P];
+    }
+    
+    if (InRegion(S))
+    {
+        if (IsFluid(S))
+            presSFace = 0.5 * (presFieldLastTime[P] + presFieldLastTime[S]);
+        else
+            presSFace = presFieldLastTime[P];
+    }
+    else
+    {
+        if (presBndTypeY0 == PRES_BND_FIXED_VALUE)
+            presSFace = 0;
+        else if (presBndTypeY0 == PRES_BND_ZERO_GRAD)
+            presSFace = presFieldLastTime[P];
+        else if (presBndTypeY0 == PRES_BND_SYMMETRY)
+            presSFace = presFieldLastTime[P];
+    }
+    
+    if (InRegion(U))
+    {
+        if (IsFluid(U))
+            presUFace = 0.5 * (presFieldLastTime[P] + presFieldLastTime[U]);
+        else
+            presUFace = presFieldLastTime[P];
+    }
+    else
+    {
+        if (presBndTypeZn == PRES_BND_FIXED_VALUE)
+            presUFace = 0;
+        else if (presBndTypeZn == PRES_BND_ZERO_GRAD)
+            presUFace = presFieldLastTime[P];
+        else if (presBndTypeZn == PRES_BND_SYMMETRY)
+            presUFace = presFieldLastTime[P];
+    }
+    
+    if (InRegion(D))
+    {
+        if (IsFluid(D))
+            presDFace = 0.5 * (presFieldLastTime[P] + presFieldLastTime[D]);
+        else
+            presDFace = presFieldLastTime[P];
+    }
+    else
+    {
+        if (presBndTypeZ0 == PRES_BND_FIXED_VALUE)
+            presDFace = 0;
+        else if (presBndTypeZ0 == PRES_BND_ZERO_GRAD)
+            presDFace = presFieldLastTime[P];
+        else if (presBndTypeZ0 == PRES_BND_SYMMETRY)
+            presDFace = presFieldLastTime[P];
+    }
+    
+    UPresTerm = -(1.0 / den) * ds * (presEFace - presWFace);
+    VPresTerm = -(1.0 / den) * ds * (presNFace - presSFace);
+    WPresTerm = -(1.0 / den) * ds * (presUFace - presDFace);
+    
+    // ----- Diffusion term -----
+    if (InRegion(E))
+    {
+        if (IsFluid(E))
+        {
+            UDiffTerm += nu * ds / dx * velFieldLastIter[E].x;
+            VDiffTerm += nu * ds / dx * velFieldLastIter[E].y;
+            WDiffTerm += nu * ds / dx * velFieldLastIter[E].z;
+            Dx += nu * ds / dx;
+            Dy += nu * ds / dx;
+            Dz += nu * ds / dx;
+        }
+        else
+        {
+            Dx += 2 * nu * ds / dx;
+            Dy += 2 * nu * ds / dx;
+            Dz += 2 * nu * ds / dx;
+        }
+    }
+    else
+    {
+        if (velBndTypeXn == VEL_BND_FIXED_VALUE)
+        {
+            UConstTerm += 2 * nu * ds / dx * bndFieldXn[int2(y, z)].x;
+            VConstTerm += 2 * nu * ds / dx * bndFieldXn[int2(y, z)].y;
+            WConstTerm += 2 * nu * ds / dx * bndFieldXn[int2(y, z)].z;
+            Dx += 2 * nu * ds / dx;
+            Dy += 2 * nu * ds / dx;
+            Dz += 2 * nu * ds / dx;
+        }
+        else if (velBndTypeXn == VEL_BND_SYMMETRY)
+        {
+            Dx += 2 * nu * ds / dx;
+        }
+        // Zero-gradient velocity boundary condition does not need explicit treatment.
+    }
+    
+    if (InRegion(W))
+    {
+        if (IsFluid(W))
+        {
+            UDiffTerm += nu * ds / dx * velFieldLastIter[W].x;
+            VDiffTerm += nu * ds / dx * velFieldLastIter[W].y;
+            WDiffTerm += nu * ds / dx * velFieldLastIter[W].z;
+            Dx += nu * ds / dx;
+            Dy += nu * ds / dx;
+            Dz += nu * ds / dx;
+        }
+        else
+        {
+            Dx += 2 * nu * ds / dx;
+            Dy += 2 * nu * ds / dx;
+            Dz += 2 * nu * ds / dx;
+        }
+    }
+    else
+    {
+        if (velBndTypeX0 == VEL_BND_FIXED_VALUE)
+        {
+            UConstTerm += 2 * nu * ds / dx * bndFieldX0[int2(y, z)].x;
+            VConstTerm += 2 * nu * ds / dx * bndFieldX0[int2(y, z)].y;
+            WConstTerm += 2 * nu * ds / dx * bndFieldX0[int2(y, z)].z;
+            Dx += 2 * nu * ds / dx;
+            Dy += 2 * nu * ds / dx;
+            Dz += 2 * nu * ds / dx;
+        }
+        else if (velBndTypeX0 == VEL_BND_SYMMETRY)
+        {
+            Dx += 2 * nu * ds / dx;
+        }
+        // Zero-gradient velocity boundary condition does not need explicit treatment.
+    }
+    
+    if (InRegion(N))
+    {
+        if (IsFluid(N))
+        {
+            UDiffTerm += nu * ds / dx * velFieldLastIter[N].x;
+            VDiffTerm += nu * ds / dx * velFieldLastIter[N].y;
+            WDiffTerm += nu * ds / dx * velFieldLastIter[N].z;
+            Dx += nu * ds / dx;
+            Dy += nu * ds / dx;
+            Dz += nu * ds / dx;
+        }
+        else
+        {
+            Dx += 2 * nu * ds / dx;
+            Dy += 2 * nu * ds / dx;
+            Dz += 2 * nu * ds / dx;
+        }
+    }
+    else
+    {
+        if (velBndTypeYn == VEL_BND_FIXED_VALUE)
+        {
+            UConstTerm += 2 * nu * ds / dx * bndFieldYn[int2(x, z)].x;
+            VConstTerm += 2 * nu * ds / dx * bndFieldYn[int2(x, z)].y;
+            WConstTerm += 2 * nu * ds / dx * bndFieldYn[int2(x, z)].z;
+            Dx += 2 * nu * ds / dx;
+            Dy += 2 * nu * ds / dx;
+            Dz += 2 * nu * ds / dx;
+        }
+        else if (velBndTypeYn == VEL_BND_SYMMETRY)
+        {
+            Dy += 2 * nu * ds / dx;
+        }
+        // Zero-gradient velocity boundary condition does not need explicit treatment.
+    }
+    
+    if (InRegion(S))
+    {
+        if (IsFluid(S))
+        {
+            UDiffTerm += nu * ds / dx * velFieldLastIter[S].x;
+            VDiffTerm += nu * ds / dx * velFieldLastIter[S].y;
+            WDiffTerm += nu * ds / dx * velFieldLastIter[S].z;
+            Dx += nu * ds / dx;
+            Dy += nu * ds / dx;
+            Dz += nu * ds / dx;
+        }
+        else
+        {
+            Dx += 2 * nu * ds / dx;
+            Dy += 2 * nu * ds / dx;
+            Dz += 2 * nu * ds / dx;
+        }
+    }
+    else
+    {
+        if (velBndTypeY0 == VEL_BND_FIXED_VALUE)
+        {
+            UConstTerm += 2 * nu * ds / dx * bndFieldY0[int2(x, z)].x;
+            VConstTerm += 2 * nu * ds / dx * bndFieldY0[int2(x, z)].y;
+            WConstTerm += 2 * nu * ds / dx * bndFieldY0[int2(x, z)].z;
+            Dx += 2 * nu * ds / dx;
+            Dy += 2 * nu * ds / dx;
+            Dz += 2 * nu * ds / dx;
+        }
+        else if (velBndTypeY0 == VEL_BND_SYMMETRY)
+        {
+            Dy += 2 * nu * ds / dx;
+        }
+        // Zero-gradient velocity boundary condition does not need explicit treatment.
+    }
+    
+    if (InRegion(U))
+    {
+        if (IsFluid(U))
+        {
+            UDiffTerm += nu * ds / dx * velFieldLastIter[U].x;
+            VDiffTerm += nu * ds / dx * velFieldLastIter[U].y;
+            WDiffTerm += nu * ds / dx * velFieldLastIter[U].z;
+            Dx += nu * ds / dx;
+            Dy += nu * ds / dx;
+            Dz += nu * ds / dx;
+        }
+        else
+        {
+            Dx += 2 * nu * ds / dx;
+            Dy += 2 * nu * ds / dx;
+            Dz += 2 * nu * ds / dx;
+        }
+    }
+    else
+    {
+        if (velBndTypeZn == VEL_BND_FIXED_VALUE)
+        {
+            UConstTerm += 2 * nu * ds / dx * bndFieldZn[int2(x, y)].x;
+            VConstTerm += 2 * nu * ds / dx * bndFieldZn[int2(x, y)].y;
+            WConstTerm += 2 * nu * ds / dx * bndFieldZn[int2(x, y)].z;
+            Dx += 2 * nu * ds / dx;
+            Dy += 2 * nu * ds / dx;
+            Dz += 2 * nu * ds / dx;
+        }
+        else if (velBndTypeZn == VEL_BND_SYMMETRY)
+        {
+            Dz += 2 * nu * ds / dx;
+        }
+        // Zero-gradient velocity boundary condition does not need explicit treatment.
+    }
+    
+    if (InRegion(D))
+    {
+        if (IsFluid(D))
+        {
+            UDiffTerm += nu * ds / dx * velFieldLastIter[D].x;
+            VDiffTerm += nu * ds / dx * velFieldLastIter[D].y;
+            WDiffTerm += nu * ds / dx * velFieldLastIter[D].z;
+            Dx += nu * ds / dx;
+            Dy += nu * ds / dx;
+            Dz += nu * ds / dx;
+        }
+        else
+        {
+            Dx += 2 * nu * ds / dx;
+            Dy += 2 * nu * ds / dx;
+            Dz += 2 * nu * ds / dx;
+        }
+    }
+    else
+    {
+        if (velBndTypeZ0 == VEL_BND_FIXED_VALUE)
+        {
+            UConstTerm += 2 * nu * ds / dx * bndFieldZ0[int2(x, y)].x;
+            VConstTerm += 2 * nu * ds / dx * bndFieldZ0[int2(x, y)].y;
+            WConstTerm += 2 * nu * ds / dx * bndFieldZ0[int2(x, y)].z;
+            Dx += 2 * nu * ds / dx;
+            Dy += 2 * nu * ds / dx;
+            Dz += 2 * nu * ds / dx;
+        }
+        else if (velBndTypeZ0 == VEL_BND_SYMMETRY)
+        {
+            Dz += 2 * nu * ds / dx;
+        }
+        // Zero-gradient velocity boundary condition does not need explicit treatment.
+    }
+    
+    // ----- Time derivative term -----
+    UConstTerm += dv / dt * velFieldLastTime[P].x;
+    VConstTerm += dv / dt * velFieldLastTime[P].y;
+    WConstTerm += dv / dt * velFieldLastTime[P].z;
+    
+    // ----- Force term -----
+    UConstTerm += dv * externalForce.x;
+    VConstTerm += dv * externalForce.y;
+    WConstTerm += dv * externalForce.z;
+    
+    // Calculate the final predicted velocities.
+    float predictedVelX = 1.0 / Dx * (UAdvectTerm + UPresTerm + UDiffTerm + UConstTerm);
+    float predictedVelY = 1.0 / Dy * (VAdvectTerm + VPresTerm + VDiffTerm + VConstTerm);
+    float predictedVelZ = 1.0 / Dz * (WAdvectTerm + WPresTerm + WDiffTerm + WConstTerm);
+    
+    velField[id] = float4(predictedVelX, predictedVelY, predictedVelZ, 0.0f);
+    
+    // Store the diagonal terms for pressure correction.
+    DField[id] = float4(Dx, Dy, Dz, 0.0f);
+}
+
+// ----- Velocity prediction step with LES model -----
+[numthreads(8, 8, 8)]
+void CSComputePredictedVelLES(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (!InRegion(id))
+        return;
+    
+    if (flagField[int3(x, y, z)] != CELL_FLUID)
+        return;
+    
+    float Dx = dv / dt, Dy = dv / dt, Dz = dv / dt;
+    
+    float UAdvectTerm = 0, UPresTerm = 0, UDiffTerm = 0, UConstTerm = 0;
+    float VAdvectTerm = 0, VPresTerm = 0, VDiffTerm = 0, VConstTerm = 0;
+    float WAdvectTerm = 0, WPresTerm = 0, WDiffTerm = 0, WConstTerm = 0;
+    
+    int3 P = int3(x, y, z);
+    int3 E = int3(x + 1, y, z);
+    int3 W = int3(x - 1, y, z);
+    int3 N = int3(x, y + 1, z);
+    int3 S = int3(x, y - 1, z);
+    int3 U = int3(x, y, z + 1);
+    int3 D = int3(x, y, z - 1);
+    
+    // ----- Advection term -----
+    // Central difference scheme is used to calculate face velocity. 
+    // ue' * ue, ve' * ue, we' * ue
+    if (InRegion(E))
+    {
+        if (IsFluid(E))
+        {
+            UAdvectTerm -= ds * 0.25 * velFieldLastIter[E].x * (velFieldLastTime[P].x + velFieldLastTime[E].x);
+            VAdvectTerm -= ds * 0.25 * velFieldLastIter[E].y * (velFieldLastTime[P].x + velFieldLastTime[E].x);
+            WAdvectTerm -= ds * 0.25 * velFieldLastIter[E].z * (velFieldLastTime[P].x + velFieldLastTime[E].x);
+            Dx += ds * 0.25 * (velFieldLastTime[P].x + velFieldLastTime[E].x);
+            Dy += ds * 0.25 * (velFieldLastTime[P].x + velFieldLastTime[E].x);
+            Dz += ds * 0.25 * (velFieldLastTime[P].x + velFieldLastTime[E].x);
+        }
+        // Solid cell does not need explicit treatment.
+    }
+    else
+    {
+        if (velBndTypeXn == VEL_BND_FIXED_VALUE)
+        {
+            UConstTerm -= ds * bndFieldXn[int2(y, z)].x * bndFieldXn[int2(y, z)].x;
+            VConstTerm -= ds * bndFieldXn[int2(y, z)].y * bndFieldXn[int2(y, z)].x;
+            WConstTerm -= ds * bndFieldXn[int2(y, z)].z * bndFieldXn[int2(y, z)].x;
+        }
+        else if (velBndTypeXn == VEL_BND_ZERO_GRAD)
+        {
+            Dx += ds * velFieldLastTime[P].x;
+            Dy += ds * velFieldLastTime[P].x;
+            Dz += ds * velFieldLastTime[P].x;
+        }
+        // Symmetry boundary does not need explicit treatment.
+    }
+    
+    // uw' * uw, vw' * uw, vw' * uw
+    if (InRegion(W))
+    {
+        if (IsFluid(W))
+        {
+            UAdvectTerm += ds * 0.25 * velFieldLastIter[W].x * (velFieldLastTime[P].x + velFieldLastTime[W].x);
+            VAdvectTerm += ds * 0.25 * velFieldLastIter[W].y * (velFieldLastTime[P].x + velFieldLastTime[W].x);
+            WAdvectTerm += ds * 0.25 * velFieldLastIter[W].z * (velFieldLastTime[P].x + velFieldLastTime[W].x);
+            Dx -= ds * 0.25 * (velFieldLastTime[P].x + velFieldLastTime[W].x);
+            Dy -= ds * 0.25 * (velFieldLastTime[P].x + velFieldLastTime[W].x);
+            Dz -= ds * 0.25 * (velFieldLastTime[P].x + velFieldLastTime[W].x);
+        }
+        // Solid cell does not need explicit treatment.
+    }
+    else
+    {
+        if (velBndTypeX0 == VEL_BND_FIXED_VALUE)
+        {
+            UConstTerm += ds * bndFieldX0[int2(y, z)].x * bndFieldX0[int2(y, z)].x;
+            VConstTerm += ds * bndFieldX0[int2(y, z)].y * bndFieldX0[int2(y, z)].x;
+            WConstTerm += ds * bndFieldX0[int2(y, z)].z * bndFieldX0[int2(y, z)].x;
+        }
+        else if (velBndTypeX0 == VEL_BND_ZERO_GRAD)
+        {
+            Dx -= ds * velFieldLastTime[P].x;
+            Dy -= ds * velFieldLastTime[P].x;
+            Dz -= ds * velFieldLastTime[P].x;
+        }
+        // Symmetry boundary does not need explicit treatment.
+    }
+    
+    // un' * vn, vn' * vn, wn' * vn
+    if (InRegion(N))
+    {
+        if (IsFluid(N))
+        {
+            UAdvectTerm -= ds * 0.25 * velFieldLastIter[N].x * (velFieldLastTime[P].y + velFieldLastTime[N].y);
+            VAdvectTerm -= ds * 0.25 * velFieldLastIter[N].y * (velFieldLastTime[P].y + velFieldLastTime[N].y);
+            WAdvectTerm -= ds * 0.25 * velFieldLastIter[N].z * (velFieldLastTime[P].y + velFieldLastTime[N].y);
+            Dx += ds * 0.25 * (velFieldLastTime[P].y + velFieldLastTime[N].y);
+            Dy += ds * 0.25 * (velFieldLastTime[P].y + velFieldLastTime[N].y);
+            Dz += ds * 0.25 * (velFieldLastTime[P].y + velFieldLastTime[N].y);
+        }
+        // Solid cell does not need explicit treatment.
+    }
+    else
+    {
+        if (velBndTypeYn == VEL_BND_FIXED_VALUE)
+        {
+            UConstTerm -= ds * bndFieldYn[int2(x, z)].x * bndFieldYn[int2(x, z)].y;
+            VConstTerm -= ds * bndFieldYn[int2(x, z)].y * bndFieldYn[int2(x, z)].y;
+            WConstTerm -= ds * bndFieldYn[int2(x, z)].z * bndFieldYn[int2(x, z)].y;
+        }
+        else if (velBndTypeYn == VEL_BND_ZERO_GRAD)
+        {
+            Dx += ds * velFieldLastTime[P].y;
+            Dy += ds * velFieldLastTime[P].y;
+            Dz += ds * velFieldLastTime[P].y;
+        }
+        // Symmetry boundary does not need explicit treatment.
+    }
+    
+    // us' * vs, vs' * vs, ws' * vs
+    if (InRegion(S))
+    {
+        if (IsFluid(S))
+        {
+            UAdvectTerm += ds * 0.25 * velFieldLastIter[S].x * (velFieldLastTime[P].y + velFieldLastTime[S].y);
+            VAdvectTerm += ds * 0.25 * velFieldLastIter[S].y * (velFieldLastTime[P].y + velFieldLastTime[S].y);
+            WAdvectTerm += ds * 0.25 * velFieldLastIter[S].z * (velFieldLastTime[P].y + velFieldLastTime[S].y);
+            Dx -= ds * 0.25 * (velFieldLastTime[P].y + velFieldLastTime[S].y);
+            Dy -= ds * 0.25 * (velFieldLastTime[P].y + velFieldLastTime[S].y);
+            Dz -= ds * 0.25 * (velFieldLastTime[P].y + velFieldLastTime[S].y);
+        }
+        // Solid cell does not need explicit treatment.
+    }
+    else
+    {
+        if (velBndTypeY0 == VEL_BND_FIXED_VALUE)
+        {
+            UConstTerm += ds * bndFieldY0[int2(x, z)].x * bndFieldY0[int2(x, z)].y;
+            VConstTerm += ds * bndFieldY0[int2(x, z)].y * bndFieldY0[int2(x, z)].y;
+            WConstTerm += ds * bndFieldY0[int2(x, z)].z * bndFieldY0[int2(x, z)].y;
+        }
+        else if (velBndTypeY0 == VEL_BND_ZERO_GRAD)
+        {
+            Dx -= ds * velFieldLastTime[P].y;
+            Dy -= ds * velFieldLastTime[P].y;
+            Dz -= ds * velFieldLastTime[P].y;
+        }
+        // Symmetry boundary does not need explicit treatment.
+    }
+    
+    // uu' * wu, vu' * wu, wu' * wu
+    if (InRegion(U))
+    {
+        if (IsFluid(U))
+        {
+            UAdvectTerm -= ds * 0.25 * velFieldLastIter[U].x * (velFieldLastTime[P].z + velFieldLastTime[U].z);
+            VAdvectTerm -= ds * 0.25 * velFieldLastIter[U].y * (velFieldLastTime[P].z + velFieldLastTime[U].z);
+            WAdvectTerm -= ds * 0.25 * velFieldLastIter[U].z * (velFieldLastTime[P].z + velFieldLastTime[U].z);
+            Dx += ds * 0.25 * (velFieldLastTime[P].z + velFieldLastTime[U].z);
+            Dy += ds * 0.25 * (velFieldLastTime[P].z + velFieldLastTime[U].z);
+            Dz += ds * 0.25 * (velFieldLastTime[P].z + velFieldLastTime[U].z);
+        }
+        // Solid cell does not need explicit treatment.
+    }
+    else
+    {
+        if (velBndTypeZn == VEL_BND_FIXED_VALUE)
+        {
+            UConstTerm -= ds * bndFieldZn[int2(x, y)].x * bndFieldZn[int2(x, y)].z;
+            VConstTerm -= ds * bndFieldZn[int2(x, y)].y * bndFieldZn[int2(x, y)].z;
+            WConstTerm -= ds * bndFieldZn[int2(x, y)].z * bndFieldZn[int2(x, y)].z;
+        }
+        else if (velBndTypeZn == VEL_BND_ZERO_GRAD)
+        {
+            Dx += ds * velFieldLastTime[P].z;
+            Dy += ds * velFieldLastTime[P].z;
+            Dz += ds * velFieldLastTime[P].z;
+        }
+        // Symmetry boundary does not need explicit treatment.
+    }
+    
+    // ud' * wd, vd' * wd, wd' * wd
+    if (InRegion(D))
+    {
+        if (IsFluid(D))
+        {
+            UAdvectTerm += ds * 0.25 * velFieldLastIter[D].x * (velFieldLastTime[P].z + velFieldLastTime[D].z);
+            VAdvectTerm += ds * 0.25 * velFieldLastIter[D].y * (velFieldLastTime[P].z + velFieldLastTime[D].z);
+            WAdvectTerm += ds * 0.25 * velFieldLastIter[D].z * (velFieldLastTime[P].z + velFieldLastTime[D].z);
+            Dx -= ds * 0.25 * (velFieldLastTime[P].z + velFieldLastTime[D].z);
+            Dy -= ds * 0.25 * (velFieldLastTime[P].z + velFieldLastTime[D].z);
+            Dz -= ds * 0.25 * (velFieldLastTime[P].z + velFieldLastTime[D].z);
+        }
+        // Solid cell does not need explicit treatment.
+    }
+    else
+    {
+        if (velBndTypeZ0 == VEL_BND_FIXED_VALUE)
+        {
+            UConstTerm += ds * bndFieldZ0[int2(x, y)].x * bndFieldZ0[int2(x, y)].z;
+            VConstTerm += ds * bndFieldZ0[int2(x, y)].y * bndFieldZ0[int2(x, y)].z;
+            WConstTerm += ds * bndFieldZ0[int2(x, y)].z * bndFieldZ0[int2(x, y)].z;
+        }
+        else if (velBndTypeZ0 == VEL_BND_ZERO_GRAD)
+        {
+            Dx -= ds * velFieldLastTime[P].z;
+            Dy -= ds * velFieldLastTime[P].z;
+            Dz -= ds * velFieldLastTime[P].z;
+        }
+        // Symmetry boundary does not need explicit treatment.
+    }
+    
+    // ----- Pressure term -----
+    float presEFace = 0, presWFace = 0, presNFace = 0, presSFace = 0, presUFace = 0, presDFace = 0;
+    
+    if (InRegion(E))
+    {
+        if (IsFluid(E))
+            presEFace = 0.5 * (presFieldLastTime[P] + presFieldLastTime[E]);
+        else
+            presEFace = presFieldLastTime[P];
+    }
+    else
+    {
+        if (presBndTypeXn == PRES_BND_FIXED_VALUE)
+            presEFace = 0;
+        else if (presBndTypeXn == PRES_BND_ZERO_GRAD)
+            presEFace = presFieldLastTime[P];
+        else if (presBndTypeXn == PRES_BND_SYMMETRY)
+            presEFace = presFieldLastTime[P];
+    }
+    
+    if (InRegion(W))
+    {
+        if (IsFluid(W))
+            presWFace = 0.5 * (presFieldLastTime[P] + presFieldLastTime[W]);
+        else
+            presWFace = presFieldLastTime[P];
+    }
+    else
+    {
+        if (presBndTypeX0 == PRES_BND_FIXED_VALUE)
+            presWFace = 0;
+        else if (presBndTypeX0 == PRES_BND_ZERO_GRAD)
+            presWFace = presFieldLastTime[P];
+        else if (presBndTypeX0 == PRES_BND_SYMMETRY)
+            presWFace = presFieldLastTime[P];
+    }
+    
+    if (InRegion(N))
+    {
+        if (IsFluid(N))
+            presNFace = 0.5 * (presFieldLastTime[P] + presFieldLastTime[N]);
+        else
+            presNFace = presFieldLastTime[P];
+    }
+    else
+    {
+        if (presBndTypeYn == PRES_BND_FIXED_VALUE)
+            presNFace = 0;
+        else if (presBndTypeYn == PRES_BND_ZERO_GRAD)
+            presNFace = presFieldLastTime[P];
+        else if (presBndTypeYn == PRES_BND_SYMMETRY)
+            presNFace = presFieldLastTime[P];
+    }
+    
+    if (InRegion(S))
+    {
+        if (IsFluid(S))
+            presSFace = 0.5 * (presFieldLastTime[P] + presFieldLastTime[S]);
+        else
+            presSFace = presFieldLastTime[P];
+    }
+    else
+    {
+        if (presBndTypeY0 == PRES_BND_FIXED_VALUE)
+            presSFace = 0;
+        else if (presBndTypeY0 == PRES_BND_ZERO_GRAD)
+            presSFace = presFieldLastTime[P];
+        else if (presBndTypeY0 == PRES_BND_SYMMETRY)
+            presSFace = presFieldLastTime[P];
+    }
+    
+    if (InRegion(U))
+    {
+        if (IsFluid(U))
+            presUFace = 0.5 * (presFieldLastTime[P] + presFieldLastTime[U]);
+        else
+            presUFace = presFieldLastTime[P];
+    }
+    else
+    {
+        if (presBndTypeZn == PRES_BND_FIXED_VALUE)
+            presUFace = 0;
+        else if (presBndTypeZn == PRES_BND_ZERO_GRAD)
+            presUFace = presFieldLastTime[P];
+        else if (presBndTypeZn == PRES_BND_SYMMETRY)
+            presUFace = presFieldLastTime[P];
+    }
+    
+    if (InRegion(D))
+    {
+        if (IsFluid(D))
+            presDFace = 0.5 * (presFieldLastTime[P] + presFieldLastTime[D]);
+        else
+            presDFace = presFieldLastTime[P];
+    }
+    else
+    {
+        if (presBndTypeZ0 == PRES_BND_FIXED_VALUE)
+            presDFace = 0;
+        else if (presBndTypeZ0 == PRES_BND_ZERO_GRAD)
+            presDFace = presFieldLastTime[P];
+        else if (presBndTypeZ0 == PRES_BND_SYMMETRY)
+            presDFace = presFieldLastTime[P];
+    }
+    
+    UPresTerm = -(1.0 / den) * ds * (presEFace - presWFace);
+    VPresTerm = -(1.0 / den) * ds * (presNFace - presSFace);
+    WPresTerm = -(1.0 / den) * ds * (presUFace - presDFace);
+    
+    // ----- Diffusion term -----
+    
+    // Calculate face viscosities with eddy viscosity included.
+    float visEFace = nu, visWFace = nu, visNFace = nu, visSFace = nu, visUFace = nu, visDFace = nu;
+    if (useLES)
+    {
+        visEFace = nu + eddyVisField[P];
+        visWFace = nu + eddyVisField[P];
+        visNFace = nu + eddyVisField[P];
+        visSFace = nu + eddyVisField[P];
+        visUFace = nu + eddyVisField[P];
+        visDFace = nu + eddyVisField[P];
+        if (InRegionAndIsFluid(E))
+            visEFace = nu + 0.5 * (eddyVisField[P] + eddyVisField[E]);
+        if (InRegionAndIsFluid(W))
+            visWFace = nu + 0.5 * (eddyVisField[P] + eddyVisField[W]);
+        if (InRegionAndIsFluid(N))
+            visNFace = nu + 0.5 * (eddyVisField[P] + eddyVisField[N]);
+        if (InRegionAndIsFluid(S))
+            visSFace = nu + 0.5 * (eddyVisField[P] + eddyVisField[S]);
+        if (InRegionAndIsFluid(U))
+            visUFace = nu + 0.5 * (eddyVisField[P] + eddyVisField[U]);
+        if (InRegionAndIsFluid(D))
+            visDFace = nu + 0.5 * (eddyVisField[P] + eddyVisField[D]);
+    }
+    
+    if (InRegion(E))
+    {
+        if (IsFluid(E))
+        {
+            UDiffTerm += visEFace * ds / dx * velFieldLastIter[E].x;
+            VDiffTerm += visEFace * ds / dx * velFieldLastIter[E].y;
+            WDiffTerm += visEFace * ds / dx * velFieldLastIter[E].z;
+            Dx += visEFace * ds / dx;
+            Dy += visEFace * ds / dx;
+            Dz += visEFace * ds / dx;
+        }
+        else
+        {
+            Dx += 2 * visEFace * ds / dx;
+            Dy += 2 * visEFace * ds / dx;
+            Dz += 2 * visEFace * ds / dx;
+        }
+    }
+    else
+    {
+        if (velBndTypeXn == VEL_BND_FIXED_VALUE)
+        {
+            UConstTerm += 2 * visEFace * ds / dx * bndFieldXn[int2(y, z)].x;
+            VConstTerm += 2 * visEFace * ds / dx * bndFieldXn[int2(y, z)].y;
+            WConstTerm += 2 * visEFace * ds / dx * bndFieldXn[int2(y, z)].z;
+            Dx += 2 * visEFace * ds / dx;
+            Dy += 2 * visEFace * ds / dx;
+            Dz += 2 * visEFace * ds / dx;
+        }
+        else if (velBndTypeXn == VEL_BND_SYMMETRY)
+        {
+            Dx += 2 * visEFace * ds / dx;
+        }
+        // Zero-gradient velocity boundary condition does not need explicit treatment.
+    }
+    
+    if (InRegion(W))
+    {
+        if (IsFluid(W))
+        {
+            UDiffTerm += visWFace * ds / dx * velFieldLastIter[W].x;
+            VDiffTerm += visWFace * ds / dx * velFieldLastIter[W].y;
+            WDiffTerm += visWFace * ds / dx * velFieldLastIter[W].z;
+            Dx += visWFace * ds / dx;
+            Dy += visWFace * ds / dx;
+            Dz += visWFace * ds / dx;
+        }
+        else
+        {
+            Dx += 2 * visWFace * ds / dx;
+            Dy += 2 * visWFace * ds / dx;
+            Dz += 2 * visWFace * ds / dx;
+        }
+    }
+    else
+    {
+        if (velBndTypeX0 == VEL_BND_FIXED_VALUE)
+        {
+            UConstTerm += 2 * visWFace * ds / dx * bndFieldX0[int2(y, z)].x;
+            VConstTerm += 2 * visWFace * ds / dx * bndFieldX0[int2(y, z)].y;
+            WConstTerm += 2 * visWFace * ds / dx * bndFieldX0[int2(y, z)].z;
+            Dx += 2 * visWFace * ds / dx;
+            Dy += 2 * visWFace * ds / dx;
+            Dz += 2 * visWFace * ds / dx;
+        }
+        else if (velBndTypeX0 == VEL_BND_SYMMETRY)
+        {
+            Dx += 2 * visWFace * ds / dx;
+        }
+        // Zero-gradient velocity boundary condition does not need explicit treatment.
+    }
+    
+    if (InRegion(N))
+    {
+        if (IsFluid(N))
+        {
+            UDiffTerm += visNFace * ds / dx * velFieldLastIter[N].x;
+            VDiffTerm += visNFace * ds / dx * velFieldLastIter[N].y;
+            WDiffTerm += visNFace * ds / dx * velFieldLastIter[N].z;
+            Dx += visNFace * ds / dx;
+            Dy += visNFace * ds / dx;
+            Dz += visNFace * ds / dx;
+        }
+        else
+        {
+            Dx += 2 * visNFace * ds / dx;
+            Dy += 2 * visNFace * ds / dx;
+            Dz += 2 * visNFace * ds / dx;
+        }
+    }
+    else
+    {
+        if (velBndTypeYn == VEL_BND_FIXED_VALUE)
+        {
+            UConstTerm += 2 * visNFace * ds / dx * bndFieldYn[int2(x, z)].x;
+            VConstTerm += 2 * visNFace * ds / dx * bndFieldYn[int2(x, z)].y;
+            WConstTerm += 2 * visNFace * ds / dx * bndFieldYn[int2(x, z)].z;
+            Dx += 2 * visNFace * ds / dx;
+            Dy += 2 * visNFace * ds / dx;
+            Dz += 2 * visNFace * ds / dx;
+        }
+        else if (velBndTypeYn == VEL_BND_SYMMETRY)
+        {
+            Dy += 2 * visNFace * ds / dx;
+        }
+        // Zero-gradient velocity boundary condition does not need explicit treatment.
+    }
+    
+    if (InRegion(S))
+    {
+        if (IsFluid(S))
+        {
+            UDiffTerm += visSFace * ds / dx * velFieldLastIter[S].x;
+            VDiffTerm += visSFace * ds / dx * velFieldLastIter[S].y;
+            WDiffTerm += visSFace * ds / dx * velFieldLastIter[S].z;
+            Dx += visSFace * ds / dx;
+            Dy += visSFace * ds / dx;
+            Dz += visSFace * ds / dx;
+        }
+        else
+        {
+            Dx += 2 * visSFace * ds / dx;
+            Dy += 2 * visSFace * ds / dx;
+            Dz += 2 * visSFace * ds / dx;
+        }
+    }
+    else
+    {
+        if (velBndTypeY0 == VEL_BND_FIXED_VALUE)
+        {
+            UConstTerm += 2 * visSFace * ds / dx * bndFieldY0[int2(x, z)].x;
+            VConstTerm += 2 * visSFace * ds / dx * bndFieldY0[int2(x, z)].y;
+            WConstTerm += 2 * visSFace * ds / dx * bndFieldY0[int2(x, z)].z;
+            Dx += 2 * visSFace * ds / dx;
+            Dy += 2 * visSFace * ds / dx;
+            Dz += 2 * visSFace * ds / dx;
+        }
+        else if (velBndTypeY0 == VEL_BND_SYMMETRY)
+        {
+            Dy += 2 * visSFace * ds / dx;
+        }
+        // Zero-gradient velocity boundary condition does not need explicit treatment.
+    }
+    
+    if (InRegion(U))
+    {
+        if (IsFluid(U))
+        {
+            UDiffTerm += visUFace * ds / dx * velFieldLastIter[U].x;
+            VDiffTerm += visUFace * ds / dx * velFieldLastIter[U].y;
+            WDiffTerm += visUFace * ds / dx * velFieldLastIter[U].z;
+            Dx += visUFace * ds / dx;
+            Dy += visUFace * ds / dx;
+            Dz += visUFace * ds / dx;
+        }
+        else
+        {
+            Dx += 2 * visUFace * ds / dx;
+            Dy += 2 * visUFace * ds / dx;
+            Dz += 2 * visUFace * ds / dx;
+        }
+    }
+    else
+    {
+        if (velBndTypeZn == VEL_BND_FIXED_VALUE)
+        {
+            UConstTerm += 2 * visUFace * ds / dx * bndFieldZn[int2(x, y)].x;
+            VConstTerm += 2 * visUFace * ds / dx * bndFieldZn[int2(x, y)].y;
+            WConstTerm += 2 * visUFace * ds / dx * bndFieldZn[int2(x, y)].z;
+            Dx += 2 * visUFace * ds / dx;
+            Dy += 2 * visUFace * ds / dx;
+            Dz += 2 * visUFace * ds / dx;
+        }
+        else if (velBndTypeZn == VEL_BND_SYMMETRY)
+        {
+            Dz += 2 * visUFace * ds / dx;
+        }
+        // Zero-gradient velocity boundary condition does not need explicit treatment.
+    }
+    
+    if (InRegion(D))
+    {
+        if (IsFluid(D))
+        {
+            UDiffTerm += visDFace * ds / dx * velFieldLastIter[D].x;
+            VDiffTerm += visDFace * ds / dx * velFieldLastIter[D].y;
+            WDiffTerm += visDFace * ds / dx * velFieldLastIter[D].z;
+            Dx += visDFace * ds / dx;
+            Dy += visDFace * ds / dx;
+            Dz += visDFace * ds / dx;
+        }
+        else
+        {
+            Dx += 2 * visDFace * ds / dx;
+            Dy += 2 * visDFace * ds / dx;
+            Dz += 2 * visDFace * ds / dx;
+        }
+    }
+    else
+    {
+        if (velBndTypeZ0 == VEL_BND_FIXED_VALUE)
+        {
+            UConstTerm += 2 * visDFace * ds / dx * bndFieldZ0[int2(x, y)].x;
+            VConstTerm += 2 * visDFace * ds / dx * bndFieldZ0[int2(x, y)].y;
+            WConstTerm += 2 * visDFace * ds / dx * bndFieldZ0[int2(x, y)].z;
+            Dx += 2 * visDFace * ds / dx;
+            Dy += 2 * visDFace * ds / dx;
+            Dz += 2 * visDFace * ds / dx;
+        }
+        else if (velBndTypeZ0 == VEL_BND_SYMMETRY)
+        {
+            Dz += 2 * visDFace * ds / dx;
+        }
+        // Zero-gradient velocity boundary condition does not need explicit treatment.
+    }
+    
+    // ----- Time derivative term -----
+    UConstTerm += dv / dt * velFieldLastTime[P].x;
+    VConstTerm += dv / dt * velFieldLastTime[P].y;
+    WConstTerm += dv / dt * velFieldLastTime[P].z;
+    
+    // ----- Force term -----
+    UConstTerm += dv * externalForce.x;
+    VConstTerm += dv * externalForce.y;
+    WConstTerm += dv * externalForce.z;
+    
+    // ----- LES term -----
+    //if (useLES)
+    //{
+    //    UConstTerm += bField[P].x;
+    //    VConstTerm += bField[P].y;
+    //    WConstTerm += bField[P].z;
+    //}
+    
+    // Calculate the final predicted velocities.
+    float predictedVelX = 1.0 / Dx * (UAdvectTerm + UPresTerm + UDiffTerm + UConstTerm);
+    float predictedVelY = 1.0 / Dy * (VAdvectTerm + VPresTerm + VDiffTerm + VConstTerm);
+    float predictedVelZ = 1.0 / Dz * (WAdvectTerm + WPresTerm + WDiffTerm + WConstTerm);
+    
+    velField[id] = float4(predictedVelX, predictedVelY, predictedVelZ, 0.0f);
+    
+    // Store the diagonal terms for pressure correction.
+    DField[id] = float4(Dx, Dy, Dz, 0.0f);
+}
+
+// ----- Velocity prediction step with LES model -----
+[numthreads(8, 8, 8)]
+void CSVelPredictPreCompute(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (!InRegion(id))
+        return;
+    
+    if (flagField[int3(x, y, z)] != CELL_FLUID)
+        return;
+    
+    float Dx = dv / dt, Dy = dv / dt, Dz = dv / dt;
+    
+    float bTermU = 0, bTermV = 0, bTermW = 0;
+    
+    int3 P = int3(x, y, z);
+    int3 E = int3(x + 1, y, z);
+    int3 W = int3(x - 1, y, z);
+    int3 N = int3(x, y + 1, z);
+    int3 S = int3(x, y - 1, z);
+    int3 U = int3(x, y, z + 1);
+    int3 D = int3(x, y, z - 1);
+    
+    // ----- Advection term -----
+    // Central difference scheme is used to calculate face velocity. 
+    // ue' * ue, ve' * ue, we' * ue
+    if (InRegion(E))
+    {
+        if (IsFluid(E))
+        {
+            Dx += ds * 0.25 * (velFieldLastTime[P].x + velFieldLastTime[E].x);
+            Dy += ds * 0.25 * (velFieldLastTime[P].x + velFieldLastTime[E].x);
+            Dz += ds * 0.25 * (velFieldLastTime[P].x + velFieldLastTime[E].x);
+        }
+        // Solid cell does not need explicit treatment.
+    }
+    else
+    {
+        if (velBndTypeXn == VEL_BND_FIXED_VALUE)
+        {
+            bTermU -= ds * bndFieldXn[int2(y, z)].x * bndFieldXn[int2(y, z)].x;
+            bTermV -= ds * bndFieldXn[int2(y, z)].y * bndFieldXn[int2(y, z)].x;
+            bTermW -= ds * bndFieldXn[int2(y, z)].z * bndFieldXn[int2(y, z)].x;
+        }
+        else if (velBndTypeXn == VEL_BND_ZERO_GRAD)
+        {
+            Dx += ds * velFieldLastTime[P].x;
+            Dy += ds * velFieldLastTime[P].x;
+            Dz += ds * velFieldLastTime[P].x;
+        }
+        // Symmetry boundary does not need explicit treatment.
+    }
+    
+    // uw' * uw, vw' * uw, vw' * uw
+    if (InRegion(W))
+    {
+        if (IsFluid(W))
+        {
+            Dx -= ds * 0.25 * (velFieldLastTime[P].x + velFieldLastTime[W].x);
+            Dy -= ds * 0.25 * (velFieldLastTime[P].x + velFieldLastTime[W].x);
+            Dz -= ds * 0.25 * (velFieldLastTime[P].x + velFieldLastTime[W].x);
+        }
+        // Solid cell does not need explicit treatment.
+    }
+    else
+    {
+        if (velBndTypeX0 == VEL_BND_FIXED_VALUE)
+        {
+            bTermU += ds * bndFieldX0[int2(y, z)].x * bndFieldX0[int2(y, z)].x;
+            bTermV += ds * bndFieldX0[int2(y, z)].y * bndFieldX0[int2(y, z)].x;
+            bTermW += ds * bndFieldX0[int2(y, z)].z * bndFieldX0[int2(y, z)].x;
+        }
+        else if (velBndTypeX0 == VEL_BND_ZERO_GRAD)
+        {
+            Dx -= ds * velFieldLastTime[P].x;
+            Dy -= ds * velFieldLastTime[P].x;
+            Dz -= ds * velFieldLastTime[P].x;
+        }
+        // Symmetry boundary does not need explicit treatment.
+    }
+    
+    // un' * vn, vn' * vn, wn' * vn
+    if (InRegion(N))
+    {
+        if (IsFluid(N))
+        {
+            Dx += ds * 0.25 * (velFieldLastTime[P].y + velFieldLastTime[N].y);
+            Dy += ds * 0.25 * (velFieldLastTime[P].y + velFieldLastTime[N].y);
+            Dz += ds * 0.25 * (velFieldLastTime[P].y + velFieldLastTime[N].y);
+        }
+        // Solid cell does not need explicit treatment.
+    }
+    else
+    {
+        if (velBndTypeYn == VEL_BND_FIXED_VALUE)
+        {
+            bTermU -= ds * bndFieldYn[int2(x, z)].x * bndFieldYn[int2(x, z)].y;
+            bTermV -= ds * bndFieldYn[int2(x, z)].y * bndFieldYn[int2(x, z)].y;
+            bTermW -= ds * bndFieldYn[int2(x, z)].z * bndFieldYn[int2(x, z)].y;
+        }
+        else if (velBndTypeYn == VEL_BND_ZERO_GRAD)
+        {
+            Dx += ds * velFieldLastTime[P].y;
+            Dy += ds * velFieldLastTime[P].y;
+            Dz += ds * velFieldLastTime[P].y;
+        }
+        // Symmetry boundary does not need explicit treatment.
+    }
+    
+    // us' * vs, vs' * vs, ws' * vs
+    if (InRegion(S))
+    {
+        if (IsFluid(S))
+        {
+            Dx -= ds * 0.25 * (velFieldLastTime[P].y + velFieldLastTime[S].y);
+            Dy -= ds * 0.25 * (velFieldLastTime[P].y + velFieldLastTime[S].y);
+            Dz -= ds * 0.25 * (velFieldLastTime[P].y + velFieldLastTime[S].y);
+        }
+        // Solid cell does not need explicit treatment.
+    }
+    else
+    {
+        if (velBndTypeY0 == VEL_BND_FIXED_VALUE)
+        {
+            bTermU += ds * bndFieldY0[int2(x, z)].x * bndFieldY0[int2(x, z)].y;
+            bTermV += ds * bndFieldY0[int2(x, z)].y * bndFieldY0[int2(x, z)].y;
+            bTermW += ds * bndFieldY0[int2(x, z)].z * bndFieldY0[int2(x, z)].y;
+        }
+        else if (velBndTypeY0 == VEL_BND_ZERO_GRAD)
+        {
+            Dx -= ds * velFieldLastTime[P].y;
+            Dy -= ds * velFieldLastTime[P].y;
+            Dz -= ds * velFieldLastTime[P].y;
+        }
+        // Symmetry boundary does not need explicit treatment.
+    }
+    
+    // uu' * wu, vu' * wu, wu' * wu
+    if (InRegion(U))
+    {
+        if (IsFluid(U))
+        {
+            Dx += ds * 0.25 * (velFieldLastTime[P].z + velFieldLastTime[U].z);
+            Dy += ds * 0.25 * (velFieldLastTime[P].z + velFieldLastTime[U].z);
+            Dz += ds * 0.25 * (velFieldLastTime[P].z + velFieldLastTime[U].z);
+        }
+        // Solid cell does not need explicit treatment.
+    }
+    else
+    {
+        if (velBndTypeZn == VEL_BND_FIXED_VALUE)
+        {
+            bTermU -= ds * bndFieldZn[int2(x, y)].x * bndFieldZn[int2(x, y)].z;
+            bTermV -= ds * bndFieldZn[int2(x, y)].y * bndFieldZn[int2(x, y)].z;
+            bTermW -= ds * bndFieldZn[int2(x, y)].z * bndFieldZn[int2(x, y)].z;
+        }
+        else if (velBndTypeZn == VEL_BND_ZERO_GRAD)
+        {
+            Dx += ds * velFieldLastTime[P].z;
+            Dy += ds * velFieldLastTime[P].z;
+            Dz += ds * velFieldLastTime[P].z;
+        }
+        // Symmetry boundary does not need explicit treatment.
+    }
+    
+    // ud' * wd, vd' * wd, wd' * wd
+    if (InRegion(D))
+    {
+        if (IsFluid(D))
+        {
+            Dx -= ds * 0.25 * (velFieldLastTime[P].z + velFieldLastTime[D].z);
+            Dy -= ds * 0.25 * (velFieldLastTime[P].z + velFieldLastTime[D].z);
+            Dz -= ds * 0.25 * (velFieldLastTime[P].z + velFieldLastTime[D].z);
+        }
+        // Solid cell does not need explicit treatment.
+    }
+    else
+    {
+        if (velBndTypeZ0 == VEL_BND_FIXED_VALUE)
+        {
+            bTermU += ds * bndFieldZ0[int2(x, y)].x * bndFieldZ0[int2(x, y)].z;
+            bTermV += ds * bndFieldZ0[int2(x, y)].y * bndFieldZ0[int2(x, y)].z;
+            bTermW += ds * bndFieldZ0[int2(x, y)].z * bndFieldZ0[int2(x, y)].z;
+        }
+        else if (velBndTypeZ0 == VEL_BND_ZERO_GRAD)
+        {
+            Dx -= ds * velFieldLastTime[P].z;
+            Dy -= ds * velFieldLastTime[P].z;
+            Dz -= ds * velFieldLastTime[P].z;
+        }
+        // Symmetry boundary does not need explicit treatment.
+    }
+    
+    // ----- Pressure term -----
+    float presEFace = 0, presWFace = 0, presNFace = 0, presSFace = 0, presUFace = 0, presDFace = 0;
+    
+    if (InRegion(E))
+    {
+        if (IsFluid(E))
+            presEFace = 0.5 * (presFieldLastTime[P] + presFieldLastTime[E]);
+        else
+            presEFace = presFieldLastTime[P];
+    }
+    else
+    {
+        if (presBndTypeXn == PRES_BND_FIXED_VALUE)
+            presEFace = 0;
+        else if (presBndTypeXn == PRES_BND_ZERO_GRAD)
+            presEFace = presFieldLastTime[P];
+        else if (presBndTypeXn == PRES_BND_SYMMETRY)
+            presEFace = presFieldLastTime[P];
+    }
+    
+    if (InRegion(W))
+    {
+        if (IsFluid(W))
+            presWFace = 0.5 * (presFieldLastTime[P] + presFieldLastTime[W]);
+        else
+            presWFace = presFieldLastTime[P];
+    }
+    else
+    {
+        if (presBndTypeX0 == PRES_BND_FIXED_VALUE)
+            presWFace = 0;
+        else if (presBndTypeX0 == PRES_BND_ZERO_GRAD)
+            presWFace = presFieldLastTime[P];
+        else if (presBndTypeX0 == PRES_BND_SYMMETRY)
+            presWFace = presFieldLastTime[P];
+    }
+    
+    if (InRegion(N))
+    {
+        if (IsFluid(N))
+            presNFace = 0.5 * (presFieldLastTime[P] + presFieldLastTime[N]);
+        else
+            presNFace = presFieldLastTime[P];
+    }
+    else
+    {
+        if (presBndTypeYn == PRES_BND_FIXED_VALUE)
+            presNFace = 0;
+        else if (presBndTypeYn == PRES_BND_ZERO_GRAD)
+            presNFace = presFieldLastTime[P];
+        else if (presBndTypeYn == PRES_BND_SYMMETRY)
+            presNFace = presFieldLastTime[P];
+    }
+    
+    if (InRegion(S))
+    {
+        if (IsFluid(S))
+            presSFace = 0.5 * (presFieldLastTime[P] + presFieldLastTime[S]);
+        else
+            presSFace = presFieldLastTime[P];
+    }
+    else
+    {
+        if (presBndTypeY0 == PRES_BND_FIXED_VALUE)
+            presSFace = 0;
+        else if (presBndTypeY0 == PRES_BND_ZERO_GRAD)
+            presSFace = presFieldLastTime[P];
+        else if (presBndTypeY0 == PRES_BND_SYMMETRY)
+            presSFace = presFieldLastTime[P];
+    }
+    
+    if (InRegion(U))
+    {
+        if (IsFluid(U))
+            presUFace = 0.5 * (presFieldLastTime[P] + presFieldLastTime[U]);
+        else
+            presUFace = presFieldLastTime[P];
+    }
+    else
+    {
+        if (presBndTypeZn == PRES_BND_FIXED_VALUE)
+            presUFace = 0;
+        else if (presBndTypeZn == PRES_BND_ZERO_GRAD)
+            presUFace = presFieldLastTime[P];
+        else if (presBndTypeZn == PRES_BND_SYMMETRY)
+            presUFace = presFieldLastTime[P];
+    }
+    
+    if (InRegion(D))
+    {
+        if (IsFluid(D))
+            presDFace = 0.5 * (presFieldLastTime[P] + presFieldLastTime[D]);
+        else
+            presDFace = presFieldLastTime[P];
+    }
+    else
+    {
+        if (presBndTypeZ0 == PRES_BND_FIXED_VALUE)
+            presDFace = 0;
+        else if (presBndTypeZ0 == PRES_BND_ZERO_GRAD)
+            presDFace = presFieldLastTime[P];
+        else if (presBndTypeZ0 == PRES_BND_SYMMETRY)
+            presDFace = presFieldLastTime[P];
+    }
+    
+    bTermU += -(1.0 / den) * ds * (presEFace - presWFace);
+    bTermV += -(1.0 / den) * ds * (presNFace - presSFace);
+    bTermW += -(1.0 / den) * ds * (presUFace - presDFace);
+    
+    // ----- Diffusion term -----
+    
+    // Calculate face viscosities with eddy viscosity included.
+    float visEFace = nu, visWFace = nu, visNFace = nu, visSFace = nu, visUFace = nu, visDFace = nu;
+    if (useLES)
+    {
+        visEFace = nu + eddyVisField[P];
+        visWFace = nu + eddyVisField[P];
+        visNFace = nu + eddyVisField[P];
+        visSFace = nu + eddyVisField[P];
+        visUFace = nu + eddyVisField[P];
+        visDFace = nu + eddyVisField[P];
+        
+        if (InRegionAndIsFluid(E))
+            visEFace = nu + 0.5 * (eddyVisField[P] + eddyVisField[E]);
+        else if (InRegionAndIsSolid(E))
+            visEFace = nu + faceEddyVisField[E].x;
+        
+        if (InRegionAndIsFluid(W))
+            visWFace = nu + 0.5 * (eddyVisField[P] + eddyVisField[W]);
+        else if (InRegionAndIsSolid(W))
+            visWFace = nu + faceEddyVisField[P].x;
+        
+        if (InRegionAndIsFluid(N))
+            visNFace = nu + 0.5 * (eddyVisField[P] + eddyVisField[N]);
+        else if (InRegionAndIsSolid(N))
+            visNFace = nu + faceEddyVisField[N].y;
+        
+        if (InRegionAndIsFluid(S))
+            visSFace = nu + 0.5 * (eddyVisField[P] + eddyVisField[S]);
+        else if (InRegionAndIsSolid(S) || (!InRegion(S) && velBndTypeY0 == VEL_BND_FIXED_VALUE))
+            visSFace = nu + faceEddyVisField[P].y;
+        
+        if (InRegionAndIsFluid(U))
+            visUFace = nu + 0.5 * (eddyVisField[P] + eddyVisField[U]);
+        else if (InRegionAndIsSolid(U))
+            visUFace = nu + faceEddyVisField[U].z;
+        
+        if (InRegionAndIsFluid(D))
+            visDFace = nu + 0.5 * (eddyVisField[P] + eddyVisField[D]);
+        else if (InRegionAndIsSolid(D))
+            visDFace = nu + faceEddyVisField[P].z;
+    }
+    
+    if (InRegion(E))
+    {
+        if (IsFluid(E))
+        {
+            Dx += visEFace * ds / dx;
+            Dy += visEFace * ds / dx;
+            Dz += visEFace * ds / dx;
+        }
+        else
+        {
+            // In theory, this term should be zero, since du/dx + dv/dy + dw/dz = 0, and 
+            // dv/dy = dw/dz = 0 at east boundary. But numerically it is often not treated like 
+            // that.
+            Dx += 2 * visEFace * ds / dx; 
+            Dy += 2 * visEFace * ds / dx;
+            Dz += 2 * visEFace * ds / dx;
+        }
+    }
+    else
+    {
+        if (velBndTypeXn == VEL_BND_FIXED_VALUE)
+        {
+            bTermU += 2 * visEFace * ds / dx * bndFieldXn[int2(y, z)].x;
+            bTermV += 2 * visEFace * ds / dx * bndFieldXn[int2(y, z)].y;
+            bTermW += 2 * visEFace * ds / dx * bndFieldXn[int2(y, z)].z;
+            Dx += 2 * visEFace * ds / dx;
+            Dy += 2 * visEFace * ds / dx;
+            Dz += 2 * visEFace * ds / dx;
+        }
+        else if (velBndTypeXn == VEL_BND_SYMMETRY)
+        {
+            Dx += 2 * visEFace * ds / dx;
+        }
+        // Zero-gradient velocity boundary condition does not need explicit treatment.
+    }
+    
+    if (InRegion(W))
+    {
+        if (IsFluid(W))
+        {
+            Dx += visWFace * ds / dx;
+            Dy += visWFace * ds / dx;
+            Dz += visWFace * ds / dx;
+        }
+        else
+        {
+            Dx += 2 * visWFace * ds / dx;
+            Dy += 2 * visWFace * ds / dx;
+            Dz += 2 * visWFace * ds / dx;
+        }
+    }
+    else
+    {
+        if (velBndTypeX0 == VEL_BND_FIXED_VALUE)
+        {
+            bTermU += 2 * visWFace * ds / dx * bndFieldX0[int2(y, z)].x;
+            bTermV += 2 * visWFace * ds / dx * bndFieldX0[int2(y, z)].y;
+            bTermW += 2 * visWFace * ds / dx * bndFieldX0[int2(y, z)].z;
+            Dx += 2 * visWFace * ds / dx;
+            Dy += 2 * visWFace * ds / dx;
+            Dz += 2 * visWFace * ds / dx;
+        }
+        else if (velBndTypeX0 == VEL_BND_SYMMETRY)
+        {
+            Dx += 2 * visWFace * ds / dx;
+        }
+        // Zero-gradient velocity boundary condition does not need explicit treatment.
+    }
+    
+    if (InRegion(N))
+    {
+        if (IsFluid(N))
+        {
+            Dx += visNFace * ds / dx;
+            Dy += visNFace * ds / dx;
+            Dz += visNFace * ds / dx;
+        }
+        else
+        {
+            Dx += 2 * visNFace * ds / dx;
+            Dy += 2 * visNFace * ds / dx;
+            Dz += 2 * visNFace * ds / dx;
+        }
+    }
+    else
+    {
+        if (velBndTypeYn == VEL_BND_FIXED_VALUE)
+        {
+            bTermU += 2 * visNFace * ds / dx * bndFieldYn[int2(x, z)].x;
+            bTermV += 2 * visNFace * ds / dx * bndFieldYn[int2(x, z)].y;
+            bTermW += 2 * visNFace * ds / dx * bndFieldYn[int2(x, z)].z;
+            Dx += 2 * visNFace * ds / dx;
+            Dy += 2 * visNFace * ds / dx;
+            Dz += 2 * visNFace * ds / dx;
+        }
+        else if (velBndTypeYn == VEL_BND_SYMMETRY)
+        {
+            Dy += 2 * visNFace * ds / dx;
+        }
+        // Zero-gradient velocity boundary condition does not need explicit treatment.
+    }
+    
+    if (InRegion(S))
+    {
+        if (IsFluid(S))
+        {
+            Dx += visSFace * ds / dx;
+            Dy += visSFace * ds / dx;
+            Dz += visSFace * ds / dx;
+        }
+        else
+        {
+            Dx += 2 * visSFace * ds / dx;
+            Dy += 2 * visSFace * ds / dx;
+            Dz += 2 * visSFace * ds / dx;
+        }
+    }
+    else
+    {
+        if (velBndTypeY0 == VEL_BND_FIXED_VALUE)
+        {
+            bTermU += 2 * visSFace * ds / dx * bndFieldY0[int2(x, z)].x;
+            bTermV += 2 * visSFace * ds / dx * bndFieldY0[int2(x, z)].y;
+            bTermW += 2 * visSFace * ds / dx * bndFieldY0[int2(x, z)].z;
+            Dx += 2 * visSFace * ds / dx;
+            Dy += 2 * visSFace * ds / dx;
+            Dz += 2 * visSFace * ds / dx;
+        }
+        else if (velBndTypeY0 == VEL_BND_SYMMETRY)
+        {
+            Dy += 2 * visSFace * ds / dx;
+        }
+        // Zero-gradient velocity boundary condition does not need explicit treatment.
+    }
+    
+    if (InRegion(U))
+    {
+        if (IsFluid(U))
+        {
+            Dx += visUFace * ds / dx;
+            Dy += visUFace * ds / dx;
+            Dz += visUFace * ds / dx;
+        }
+        else
+        {
+            Dx += 2 * visUFace * ds / dx;
+            Dy += 2 * visUFace * ds / dx;
+            Dz += 2 * visUFace * ds / dx;
+        }
+    }
+    else
+    {
+        if (velBndTypeZn == VEL_BND_FIXED_VALUE)
+        {
+            bTermU += 2 * visUFace * ds / dx * bndFieldZn[int2(x, y)].x;
+            bTermV += 2 * visUFace * ds / dx * bndFieldZn[int2(x, y)].y;
+            bTermW += 2 * visUFace * ds / dx * bndFieldZn[int2(x, y)].z;
+            Dx += 2 * visUFace * ds / dx;
+            Dy += 2 * visUFace * ds / dx;
+            Dz += 2 * visUFace * ds / dx;
+        }
+        else if (velBndTypeZn == VEL_BND_SYMMETRY)
+        {
+            Dz += 2 * visUFace * ds / dx;
+        }
+        // Zero-gradient velocity boundary condition does not need explicit treatment.
+    }
+    
+    if (InRegion(D))
+    {
+        if (IsFluid(D))
+        {
+            Dx += visDFace * ds / dx;
+            Dy += visDFace * ds / dx;
+            Dz += visDFace * ds / dx;
+        }
+        else
+        {
+            Dx += 2 * visDFace * ds / dx;
+            Dy += 2 * visDFace * ds / dx;
+            Dz += 2 * visDFace * ds / dx;
+        }
+    }
+    else
+    {
+        if (velBndTypeZ0 == VEL_BND_FIXED_VALUE)
+        {
+            bTermU += 2 * visDFace * ds / dx * bndFieldZ0[int2(x, y)].x;
+            bTermV += 2 * visDFace * ds / dx * bndFieldZ0[int2(x, y)].y;
+            bTermW += 2 * visDFace * ds / dx * bndFieldZ0[int2(x, y)].z;
+            Dx += 2 * visDFace * ds / dx;
+            Dy += 2 * visDFace * ds / dx;
+            Dz += 2 * visDFace * ds / dx;
+        }
+        else if (velBndTypeZ0 == VEL_BND_SYMMETRY)
+        {
+            Dz += 2 * visDFace * ds / dx;
+        }
+        // Zero-gradient velocity boundary condition does not need explicit treatment.
+    }
+    
+    // ----- Time derivative term -----
+    bTermU += dv / dt * velFieldLastTime[P].x;
+    bTermV += dv / dt * velFieldLastTime[P].y;
+    bTermW += dv / dt * velFieldLastTime[P].z;
+    
+    // ----- Force term -----
+    bTermU += dv * externalForce.x;
+    bTermV += dv * externalForce.y;
+    bTermW += dv * externalForce.z;
+    
+    // ----- LES term -----
+    if (useLES)
+    {
+        bTermU += bField[P].x;
+        bTermV += bField[P].y;
+        bTermW += bField[P].z;
+    }
+    
+    // Store the diagonal terms for A and b term, for velocity prediction and pressure correction.
+    DField[id] = float4(Dx, Dy, Dz, 0.0f);
+    bField[id] = float4(bTermU, bTermV, bTermW, 0.0f);
+}
+
+// ----- Velocity prediction step with LES model -----
+[numthreads(8, 8, 8)]
+void CSVelPredict(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (!InRegion(id))
+        return;
+    
+    if (flagField[int3(x, y, z)] != CELL_FLUID)
+        return;
+    
+    float UAdvectTerm = 0, UPresTerm = 0, UDiffTerm = 0;
+    float VAdvectTerm = 0, VPresTerm = 0, VDiffTerm = 0;
+    float WAdvectTerm = 0, WPresTerm = 0, WDiffTerm = 0;
+    
+    int3 P = int3(x, y, z);
+    int3 E = int3(x + 1, y, z);
+    int3 W = int3(x - 1, y, z);
+    int3 N = int3(x, y + 1, z);
+    int3 S = int3(x, y - 1, z);
+    int3 U = int3(x, y, z + 1);
+    int3 D = int3(x, y, z - 1);
+    
+    // ----- Advection term -----
+    // Central difference scheme is used to calculate face velocity. 
+    // ue' * ue, ve' * ue, we' * ue
+    if (InRegion(E))
+    {
+        if (IsFluid(E))
+        {
+            UAdvectTerm -= ds * 0.25 * velFieldLastIter[E].x * (velFieldLastTime[P].x + velFieldLastTime[E].x);
+            VAdvectTerm -= ds * 0.25 * velFieldLastIter[E].y * (velFieldLastTime[P].x + velFieldLastTime[E].x);
+            WAdvectTerm -= ds * 0.25 * velFieldLastIter[E].z * (velFieldLastTime[P].x + velFieldLastTime[E].x);
+        }
+        // Solid cell does not need explicit treatment.
+    }
+    
+    // uw' * uw, vw' * uw, vw' * uw
+    if (InRegion(W))
+    {
+        if (IsFluid(W))
+        {
+            UAdvectTerm += ds * 0.25 * velFieldLastIter[W].x * (velFieldLastTime[P].x + velFieldLastTime[W].x);
+            VAdvectTerm += ds * 0.25 * velFieldLastIter[W].y * (velFieldLastTime[P].x + velFieldLastTime[W].x);
+            WAdvectTerm += ds * 0.25 * velFieldLastIter[W].z * (velFieldLastTime[P].x + velFieldLastTime[W].x);
+        }
+        // Solid cell does not need explicit treatment.
+    }
+    
+    // un' * vn, vn' * vn, wn' * vn
+    if (InRegion(N))
+    {
+        if (IsFluid(N))
+        {
+            UAdvectTerm -= ds * 0.25 * velFieldLastIter[N].x * (velFieldLastTime[P].y + velFieldLastTime[N].y);
+            VAdvectTerm -= ds * 0.25 * velFieldLastIter[N].y * (velFieldLastTime[P].y + velFieldLastTime[N].y);
+            WAdvectTerm -= ds * 0.25 * velFieldLastIter[N].z * (velFieldLastTime[P].y + velFieldLastTime[N].y);
+        }
+        // Solid cell does not need explicit treatment.
+    }
+    
+    // us' * vs, vs' * vs, ws' * vs
+    if (InRegion(S))
+    {
+        if (IsFluid(S))
+        {
+            UAdvectTerm += ds * 0.25 * velFieldLastIter[S].x * (velFieldLastTime[P].y + velFieldLastTime[S].y);
+            VAdvectTerm += ds * 0.25 * velFieldLastIter[S].y * (velFieldLastTime[P].y + velFieldLastTime[S].y);
+            WAdvectTerm += ds * 0.25 * velFieldLastIter[S].z * (velFieldLastTime[P].y + velFieldLastTime[S].y);
+        }
+        // Solid cell does not need explicit treatment.
+    }
+    
+    // uu' * wu, vu' * wu, wu' * wu
+    if (InRegion(U))
+    {
+        if (IsFluid(U))
+        {
+            UAdvectTerm -= ds * 0.25 * velFieldLastIter[U].x * (velFieldLastTime[P].z + velFieldLastTime[U].z);
+            VAdvectTerm -= ds * 0.25 * velFieldLastIter[U].y * (velFieldLastTime[P].z + velFieldLastTime[U].z);
+            WAdvectTerm -= ds * 0.25 * velFieldLastIter[U].z * (velFieldLastTime[P].z + velFieldLastTime[U].z);
+        }
+        // Solid cell does not need explicit treatment.
+    }
+    
+    // ud' * wd, vd' * wd, wd' * wd
+    if (InRegion(D))
+    {
+        if (IsFluid(D))
+        {
+            UAdvectTerm += ds * 0.25 * velFieldLastIter[D].x * (velFieldLastTime[P].z + velFieldLastTime[D].z);
+            VAdvectTerm += ds * 0.25 * velFieldLastIter[D].y * (velFieldLastTime[P].z + velFieldLastTime[D].z);
+            WAdvectTerm += ds * 0.25 * velFieldLastIter[D].z * (velFieldLastTime[P].z + velFieldLastTime[D].z);
+        }
+        // Solid cell does not need explicit treatment.
+    }
+    
+    // ----- Diffusion term -----
+    
+    // Calculate face viscosities with eddy viscosity included.
+    float visEFace = nu, visWFace = nu, visNFace = nu, visSFace = nu, visUFace = nu, visDFace = nu;
+    if (useLES)
+    {
+        visEFace = nu + eddyVisField[P];
+        visWFace = nu + eddyVisField[P];
+        visNFace = nu + eddyVisField[P];
+        visSFace = nu + eddyVisField[P];
+        visUFace = nu + eddyVisField[P];
+        visDFace = nu + eddyVisField[P];
+        
+        if (InRegionAndIsFluid(E))
+            visEFace = nu + 0.5 * (eddyVisField[P] + eddyVisField[E]);
+        else if (InRegionAndIsSolid(E))
+            visEFace = nu + faceEddyVisField[E].x;
+        
+        if (InRegionAndIsFluid(W))
+            visWFace = nu + 0.5 * (eddyVisField[P] + eddyVisField[W]);
+        else if (InRegionAndIsSolid(W))
+            visWFace = nu + faceEddyVisField[P].x;
+        
+        if (InRegionAndIsFluid(N))
+            visNFace = nu + 0.5 * (eddyVisField[P] + eddyVisField[N]);
+        else if (InRegionAndIsSolid(N))
+            visNFace = nu + faceEddyVisField[N].y;
+        
+        if (InRegionAndIsFluid(S))
+            visSFace = nu + 0.5 * (eddyVisField[P] + eddyVisField[S]);
+        else if (InRegionAndIsSolid(S) || (!InRegion(S) && velBndTypeY0 == VEL_BND_FIXED_VALUE))
+            visSFace = nu + faceEddyVisField[P].y;
+        
+        if (InRegionAndIsFluid(U))
+            visUFace = nu + 0.5 * (eddyVisField[P] + eddyVisField[U]);
+        else if (InRegionAndIsSolid(U))
+            visUFace = nu + faceEddyVisField[U].z;
+        
+        if (InRegionAndIsFluid(D))
+            visDFace = nu + 0.5 * (eddyVisField[P] + eddyVisField[D]);
+        else if (InRegionAndIsSolid(D))
+            visDFace = nu + faceEddyVisField[P].z;
+    }
+    
+    if (InRegion(E))
+    {
+        if (IsFluid(E))
+        {
+            UDiffTerm += visEFace * ds / dx * velFieldLastIter[E].x;
+            VDiffTerm += visEFace * ds / dx * velFieldLastIter[E].y;
+            WDiffTerm += visEFace * ds / dx * velFieldLastIter[E].z;
+        }
+    }
+    
+    if (InRegion(W))
+    {
+        if (IsFluid(W))
+        {
+            UDiffTerm += visWFace * ds / dx * velFieldLastIter[W].x;
+            VDiffTerm += visWFace * ds / dx * velFieldLastIter[W].y;
+            WDiffTerm += visWFace * ds / dx * velFieldLastIter[W].z;
+        }
+    }
+    
+    if (InRegion(N))
+    {
+        if (IsFluid(N))
+        {
+            UDiffTerm += visNFace * ds / dx * velFieldLastIter[N].x;
+            VDiffTerm += visNFace * ds / dx * velFieldLastIter[N].y;
+            WDiffTerm += visNFace * ds / dx * velFieldLastIter[N].z;
+        }
+    }
+    
+    if (InRegion(S))
+    {
+        if (IsFluid(S))
+        {
+            UDiffTerm += visSFace * ds / dx * velFieldLastIter[S].x;
+            VDiffTerm += visSFace * ds / dx * velFieldLastIter[S].y;
+            WDiffTerm += visSFace * ds / dx * velFieldLastIter[S].z;
+        }
+    }
+    
+    if (InRegion(U))
+    {
+        if (IsFluid(U))
+        {
+            UDiffTerm += visUFace * ds / dx * velFieldLastIter[U].x;
+            VDiffTerm += visUFace * ds / dx * velFieldLastIter[U].y;
+            WDiffTerm += visUFace * ds / dx * velFieldLastIter[U].z;
+        }
+    }
+    
+    if (InRegion(D))
+    {
+        if (IsFluid(D))
+        {
+            UDiffTerm += visDFace * ds / dx * velFieldLastIter[D].x;
+            VDiffTerm += visDFace * ds / dx * velFieldLastIter[D].y;
+            WDiffTerm += visDFace * ds / dx * velFieldLastIter[D].z;
+        }
+    }
+    
+    // Calculate the final predicted velocities.
+    float predictedVelX = 1.0 / DField[id].x * (UAdvectTerm + UDiffTerm + bField[id].x);
+    float predictedVelY = 1.0 / DField[id].y * (VAdvectTerm + VDiffTerm + bField[id].y);
+    float predictedVelZ = 1.0 / DField[id].z * (WAdvectTerm + WDiffTerm + bField[id].z);
+    
+    velField[id] = float4(predictedVelX, predictedVelY, predictedVelZ, 0.0f);
+}
+
+[numthreads(8, 8, 8)]
+void CSSolvePresCorrection(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (!InRegion(id))
+        return;
+    
+    if (flagField[int3(x, y, z)] != CELL_FLUID)
+        return;
+
+    int3 P = int3(x, y, z);
+    int3 E = int3(x + 1, y, z);
+    int3 W = int3(x - 1, y, z);
+    int3 N = int3(x, y + 1, z);
+    int3 S = int3(x, y - 1, z);
+    int3 U = int3(x, y, z + 1);
+    int3 D = int3(x, y, z - 1);
+    
+    // Solve the continuity equation to obtain pressure correction.
+    float currentPresCoeff = 0;
+    float presCorrectTerm = 0;
+    float velTerm = 0;
+    
+    if (InRegion(E) && flagField[E] == CELL_FLUID)
+    {
+        float Dx = 0.5 * (DField[P].x + DField[E].x);
+        currentPresCoeff -= (dv / den) * 1 / (Dx * dx);
+        presCorrectTerm -= (dv / den) * 1 / (Dx * dx) * presCorrectFieldLastIter[E];
+        velTerm += 0.5 * (velField[P].x + velField[E].x);
+    }
+    else if (!InRegion(E))
+    { 
+        velTerm += bndFieldXn[int2(y, z)].x;
+    }
+    if (InRegion(W) && flagField[W] == CELL_FLUID)
+    {
+        float Dx = 0.5 * (DField[P].x + DField[W].x);
+        currentPresCoeff -= (dv / den) * 1 / (Dx * dx);
+        presCorrectTerm -= (dv / den) * 1 / (Dx * dx) * presCorrectFieldLastIter[W];
+        velTerm -= 0.5 * (velField[P].x + velField[W].x);
+    }
+    else if (!InRegion(W))
+    {
+        velTerm -= bndFieldX0[int2(y, z)].x;
+    }
+    if (InRegion(N) && flagField[N] == CELL_FLUID)
+    {
+        float Dy = 0.5 * (DField[P].y + DField[N].y);
+        currentPresCoeff -= (dv / den) * 1 / (Dy * dx);
+        presCorrectTerm -= (dv / den) * 1 / (Dy * dx) * presCorrectFieldLastIter[N];
+        velTerm += 0.5 * (velField[P].y + velField[N].y);
+    }
+    else if (!InRegion(N))
+    {
+        velTerm += bndFieldYn[int2(x, z)].y;
+    }
+    if (InRegion(S) && flagField[S] == CELL_FLUID)
+    {
+        float Dy = 0.5 * (DField[P].y + DField[S].y);
+        currentPresCoeff -= (dv / den) * 1 / (Dy * dx);
+        presCorrectTerm -= (dv / den) * 1 / (Dy * dx) * presCorrectFieldLastIter[S];
+        velTerm -= 0.5 * (velField[P].y + velField[S].y);
+    }
+    else if (!InRegion(S))
+    {
+        velTerm -= bndFieldY0[int2(x, z)].y;
+    }
+    if (InRegion(U) && flagField[U] == CELL_FLUID)
+    {
+        float Dz = 0.5 * (DField[P].z + DField[U].z);
+        currentPresCoeff -= (dv / den) * 1 / (Dz * dx);
+        presCorrectTerm -= (dv / den) * 1 / (Dz * dx) * presCorrectFieldLastIter[U];
+        velTerm += 0.5 * (velField[P].z + velField[U].z);
+    }
+    else if (!InRegion(U))
+    {
+        velTerm += bndFieldZn[int2(x, y)].z;
+    }
+    if (InRegion(D) && flagField[D] == CELL_FLUID)
+    {
+        float Dz = 0.5 * (DField[P].z + DField[D].z);
+        currentPresCoeff -= (dv / den) * 1 / (Dz * dx);
+        presCorrectTerm -= (dv / den) * 1 / (Dz * dx) * presCorrectFieldLastIter[D];
+        velTerm -= 0.5 * (velField[P].z + velField[D].z);
+    }
+    else if (!InRegion(D))
+    {
+        velTerm -= bndFieldZ0[int2(x, y)].z;
+    }
+    
+    presCorrectField[id] = (1 / currentPresCoeff) * (presCorrectTerm + velTerm);
+    
+    DFieldPresCorrect[id] = currentPresCoeff;
+}
+
+[numthreads(8, 8, 8)]
+void CSSolvePresCorrectionRhieChow(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (!InRegion(id))
+        return;
+    
+    if (flagField[id] != CELL_FLUID)
+        return;
+
+    int3 P = int3(x, y, z);
+    int3 E = int3(x + 1, y, z);
+    int3 W = int3(x - 1, y, z);
+    int3 N = int3(x, y + 1, z);
+    int3 S = int3(x, y - 1, z);
+    int3 U = int3(x, y, z + 1);
+    int3 D = int3(x, y, z - 1);
+    
+    int3 EE = int3(x + 2, y, z);
+    int3 WW = int3(x - 2, y, z);
+    int3 NN = int3(x, y + 2, z);
+    int3 SS = int3(x, y - 2, z);
+    int3 UU = int3(x, y, z + 2);
+    int3 DD = int3(x, y, z - 2);
+    
+    // Solve the continuity equation to obtain pressure correction.
+    float currentPresCoeff = 0;
+    float presCorrectTerm = 0;
+    float velTerm = 0;
+    
+    if (InRegion(E))
+    {
+        if (IsFluid(E))
+        {
+            float DInv = 0.5 * (1 / DField[P].x + 1 / DField[E].x);
+        
+            // CDS interpolation
+            currentPresCoeff -= (dv / den) * DInv / dx;
+            presCorrectTerm -= (dv / den) * DInv / dx * presCorrectFieldLastIter[E];
+            velTerm += 0.5 * (velField[P].x + velField[E].x);
+        
+            // Rhie-Chow correction
+            float presGrad = (presFieldLastTime[E] - presFieldLastTime[P]) / dx;
+            float presGradAve = 0;
+        
+            if (InRegionAndIsFluid(EE) && InRegionAndIsFluid(W))
+                presGradAve = 0.5 * ((presFieldLastTime[EE] - presFieldLastTime[P]) / (2 * dx) + (presFieldLastTime[E] - presFieldLastTime[W]) / (2 * dx));
+            else if (InRegionAndIsFluid(EE))
+                presGradAve = 0.5 * ((presFieldLastTime[EE] - presFieldLastTime[P]) / (2 * dx) + (presFieldLastTime[E] - presFieldLastTime[P]) / (2 * dx));
+            else if (InRegionAndIsFluid(W))
+                presGradAve = 0.5 * ((presFieldLastTime[E] - presFieldLastTime[P]) / (2 * dx) + (presFieldLastTime[E] - presFieldLastTime[W]) / (2 * dx));
+            else
+                presGradAve = presGrad;
+        
+            float velCorrectTerm = -(dv * DInv) / den * (presGrad - presGradAve);
+            velTerm += velCorrectTerm;
+        }
+        // Solid cell does not need explicit treatment.
+    }
+    else
+    {
+        // ----- Velocity boundary -----
+        if (velBndTypeXn == VEL_BND_FIXED_VALUE)
+            velTerm += bndFieldXn[int2(y, z)].x;
+        else if (velBndTypeXn == VEL_BND_ZERO_GRAD)
+            velTerm += velField[P].x;
+        // Symmetry velocity boundary does not need explicit treatment.
+        
+        // ----- Pressure boundary -----
+        if (presBndTypeXn == PRES_BND_FIXED_VALUE)
+        {
+            float DInv = 1 / DField[P].x;
+            currentPresCoeff -= 2 * (dv / den) * DInv / dx;
+        }
+        // Zero-gradient and symmetry pressure boundary do not need explicit treatment.
+    }
+    
+    if (InRegion(W))
+    {
+        if (IsFluid(W))
+        {
+            float DInv = 0.5 * (1 / DField[P].x + 1 / DField[W].x);
+        
+            // CDS interpolation
+            currentPresCoeff -= (dv / den) * DInv / dx;
+            presCorrectTerm -= (dv / den) * DInv / dx * presCorrectFieldLastIter[W];
+            velTerm -= 0.5 * (velField[P].x + velField[W].x);
+        
+            // Rhie-Chow correction
+            float presGrad = (presFieldLastTime[P] - presFieldLastTime[W]) / dx;
+            float presGradAve = 0;
+        
+            if (InRegionAndIsFluid(WW) && InRegionAndIsFluid(E))
+                presGradAve = 0.5 * ((presFieldLastTime[E] - presFieldLastTime[W]) / (2 * dx) + (presFieldLastTime[P] - presFieldLastTime[WW]) / (2 * dx));
+            else if (InRegionAndIsFluid(WW))
+                presGradAve = 0.5 * ((presFieldLastTime[P] - presFieldLastTime[W]) / (2 * dx) + (presFieldLastTime[P] - presFieldLastTime[WW]) / (2 * dx));
+            else if (InRegionAndIsFluid(E))
+                presGradAve = 0.5 * ((presFieldLastTime[E] - presFieldLastTime[W]) / (2 * dx) + (presFieldLastTime[P] - presFieldLastTime[W]) / (2 * dx));
+            else
+                presGradAve = presGrad;
+        
+            float velCorrectTerm = -(dv * DInv) / den * (presGrad - presGradAve);
+            velTerm -= velCorrectTerm;
+        }
+    }
+    else
+    {
+        // ----- Velocity boundary -----
+        if (velBndTypeX0 == VEL_BND_FIXED_VALUE)
+            velTerm -= bndFieldX0[int2(y, z)].x;
+        else if (velBndTypeX0 == VEL_BND_ZERO_GRAD)
+            velTerm -= velField[P].x;
+        // Symmetry velocity boundary does not need explicit treatment.
+        
+        // ----- Pressure boundary -----
+        if (presBndTypeX0 == PRES_BND_FIXED_VALUE)
+        {
+            float DInv = 1 / DField[P].x;
+            currentPresCoeff -= 2 * (dv / den) * DInv / dx;
+        }
+        // Zero-gradient and symmetry pressure boundary do not need explicit treatment.
+    }
+    
+    if (InRegion(N))
+    {
+        if (IsFluid(N))
+        {
+            float DInv = 0.5 * (1 / DField[P].y + 1 / DField[N].y);
+        
+            // CDS interpolation
+            currentPresCoeff -= (dv / den) * DInv / dx;
+            presCorrectTerm -= (dv / den) * DInv / dx * presCorrectFieldLastIter[N];
+            velTerm += 0.5 * (velField[P].y + velField[N].y);
+        
+            // Rhie-Chow correction
+            float presGrad = (presFieldLastTime[N] - presFieldLastTime[P]) / dx;
+            float presGradAve = 0;
+        
+            if (InRegionAndIsFluid(NN) && InRegionAndIsFluid(S))
+                presGradAve = 0.5 * ((presFieldLastTime[NN] - presFieldLastTime[P]) / (2 * dx) + (presFieldLastTime[N] - presFieldLastTime[S]) / (2 * dx));
+            else if (InRegionAndIsFluid(NN))
+                presGradAve = 0.5 * ((presFieldLastTime[NN] - presFieldLastTime[P]) / (2 * dx) + (presFieldLastTime[N] - presFieldLastTime[P]) / (2 * dx));
+            else if (InRegionAndIsFluid(S))
+                presGradAve = 0.5 * ((presFieldLastTime[N] - presFieldLastTime[P]) / (2 * dx) + (presFieldLastTime[N] - presFieldLastTime[S]) / (2 * dx));
+            else
+                presGradAve = presGrad;
+        
+            float velCorrectTerm = -(dv * DInv) / den * (presGrad - presGradAve);
+            velTerm += velCorrectTerm;
+        }
+    }
+    else
+    {
+        // ----- Velocity boundary -----
+        if (velBndTypeYn == VEL_BND_FIXED_VALUE)
+            velTerm += bndFieldYn[int2(x, z)].y;
+        else if (velBndTypeYn == VEL_BND_ZERO_GRAD)
+            velTerm += velField[P].y;
+        // Symmetry velocity boundary does not need explicit treatment.
+        
+        // ----- Pressure boundary -----
+        if (presBndTypeYn == PRES_BND_FIXED_VALUE)
+        {
+            float DInv = 1 / DField[P].y;
+            currentPresCoeff -= 2 * (dv / den) * DInv / dx;
+        }
+        // Zero-gradient and symmetry pressure boundary do not need explicit treatment.
+    }
+    
+    if (InRegion(S))
+    {
+        if (IsFluid(S))
+        {
+            float DInv = 0.5 * (1 / DField[P].y + 1 / DField[S].y);
+        
+            // CDS interpolation
+            currentPresCoeff -= (dv / den) * DInv / dx;
+            presCorrectTerm -= (dv / den) * DInv / dx * presCorrectFieldLastIter[S];
+            velTerm -= 0.5 * (velField[P].y + velField[S].y);
+        
+            // Rhie-Chow correction
+            float presGrad = (presFieldLastTime[P] - presFieldLastTime[S]) / dx;
+            float presGradAve = 0;
+        
+            if (InRegionAndIsFluid(SS) && InRegionAndIsFluid(N))
+                presGradAve = 0.5 * ((presFieldLastTime[N] - presFieldLastTime[S]) / (2 * dx) + (presFieldLastTime[P] - presFieldLastTime[SS]) / (2 * dx));
+            else if (InRegionAndIsFluid(SS))
+                presGradAve = 0.5 * ((presFieldLastTime[P] - presFieldLastTime[S]) / (2 * dx) + (presFieldLastTime[P] - presFieldLastTime[SS]) / (2 * dx));
+            else if (InRegionAndIsFluid(N))
+                presGradAve = 0.5 * ((presFieldLastTime[N] - presFieldLastTime[S]) / (2 * dx) + (presFieldLastTime[P] - presFieldLastTime[S]) / (2 * dx));
+            else
+                presGradAve = presGrad;
+        
+            float velCorrectTerm = -(dv * DInv) / den * (presGrad - presGradAve);
+            velTerm -= velCorrectTerm;
+        }
+    }
+    else
+    {
+        // ----- Velocity boundary -----
+        if (velBndTypeY0 == VEL_BND_FIXED_VALUE)
+            velTerm -= bndFieldY0[int2(x, z)].y;
+        else if (velBndTypeY0 == VEL_BND_ZERO_GRAD)
+            velTerm -= velField[P].y;
+        // Symmetry velocity boundary does not need explicit treatment.
+        
+        // ----- Pressure boundary -----
+        if (presBndTypeY0 == PRES_BND_FIXED_VALUE)
+        {
+            float DInv = 1 / DField[P].y;
+            currentPresCoeff -= 2 * (dv / den) * DInv / dx;
+        }
+        // Zero-gradient and symmetry pressure boundary do not need explicit treatment.
+    }
+    
+    if (InRegion(U))
+    {
+        if (IsFluid(U))
+        {
+            float DInv = 0.5 * (1 / DField[P].z + 1 / DField[U].z);
+        
+            // CDS interpolation
+            currentPresCoeff -= (dv / den) * DInv / dx;
+            presCorrectTerm -= (dv / den) * DInv / dx * presCorrectFieldLastIter[U];
+            velTerm += 0.5 * (velField[P].z + velField[U].z);
+        
+            // Rhie-Chow correction
+            float presGrad = (presFieldLastTime[U] - presFieldLastTime[P]) / dx;
+            float presGradAve = 0;
+        
+            if (InRegionAndIsFluid(UU) && InRegionAndIsFluid(D))
+                presGradAve = 0.5 * ((presFieldLastTime[UU] - presFieldLastTime[P]) / (2 * dx) + (presFieldLastTime[U] - presFieldLastTime[D]) / (2 * dx));
+            else if (InRegionAndIsFluid(UU))
+                presGradAve = 0.5 * ((presFieldLastTime[UU] - presFieldLastTime[P]) / (2 * dx) + (presFieldLastTime[U] - presFieldLastTime[P]) / (2 * dx));
+            else if (InRegionAndIsFluid(D))
+                presGradAve = 0.5 * ((presFieldLastTime[U] - presFieldLastTime[P]) / (2 * dx) + (presFieldLastTime[U] - presFieldLastTime[D]) / (2 * dx));
+            else
+                presGradAve = presGrad;
+        
+            float velCorrectTerm = -(dv * DInv) / den * (presGrad - presGradAve);
+            velTerm += velCorrectTerm;
+        }
+    }
+    else
+    {
+        // ----- Velocity boundary -----
+        if (velBndTypeZn == VEL_BND_FIXED_VALUE)
+            velTerm += bndFieldZn[int2(x, y)].z;
+        else if (velBndTypeZn == VEL_BND_ZERO_GRAD)
+            velTerm += velField[P].z;
+        // Symmetry velocity boundary does not need explicit treatment.
+        
+        // ----- Pressure boundary -----
+        if (presBndTypeZn == PRES_BND_FIXED_VALUE)
+        {
+            float DInv = 1 / DField[P].z;
+            currentPresCoeff -= 2 * (dv / den) * DInv / dx;
+        }
+        // Zero-gradient and symmetry pressure boundary do not need explicit treatment.
+    }
+    
+    if (InRegion(D))
+    {
+        if (IsFluid(D))
+        {
+            float DInv = 0.5 * (1 / DField[P].z + 1 / DField[D].z);
+        
+            // CDS interpolation
+            currentPresCoeff -= (dv / den) * DInv / dx;
+            presCorrectTerm -= (dv / den) * DInv / dx * presCorrectFieldLastIter[D];
+            velTerm -= 0.5 * (velField[P].z + velField[D].z);
+        
+            // Rhie-Chow correction
+            float presGrad = (presFieldLastTime[P] - presFieldLastTime[D]) / dx;
+            float presGradAve = 0;
+        
+            if (InRegionAndIsFluid(DD) && InRegionAndIsFluid(U))
+                presGradAve = 0.5 * ((presFieldLastTime[U] - presFieldLastTime[D]) / (2 * dx) + (presFieldLastTime[P] - presFieldLastTime[DD]) / (2 * dx));
+            else if (InRegionAndIsFluid(DD))
+                presGradAve = 0.5 * ((presFieldLastTime[P] - presFieldLastTime[D]) / (2 * dx) + (presFieldLastTime[P] - presFieldLastTime[DD]) / (2 * dx));
+            else if (InRegionAndIsFluid(U))
+                presGradAve = 0.5 * ((presFieldLastTime[U] - presFieldLastTime[D]) / (2 * dx) + (presFieldLastTime[P] - presFieldLastTime[D]) / (2 * dx));
+            else
+                presGradAve = presGrad;
+        
+            float velCorrectTerm = -(dv * DInv) / den * (presGrad - presGradAve);
+            velTerm -= velCorrectTerm;
+        }
+    }
+    else
+    {
+        // ----- Velocity boundary -----
+        if (velBndTypeZ0 == VEL_BND_FIXED_VALUE)
+            velTerm -= bndFieldZ0[int2(x, y)].z;
+        else if (velBndTypeZ0 == VEL_BND_ZERO_GRAD)
+            velTerm -= velField[P].z;
+        // Symmetry velocity boundary does not need explicit treatment.
+        
+        // ----- Pressure boundary -----
+        if (presBndTypeZ0 == PRES_BND_FIXED_VALUE)
+        {
+            float DInv = 1 / DField[P].z;
+            currentPresCoeff -= 2 * (dv / den) * DInv / dx;
+        }
+        // Zero-gradient and symmetry pressure boundary do not need explicit treatment.
+    }
+    
+    presCorrectField[id] = (1 / currentPresCoeff) * (presCorrectTerm + velTerm);
+    
+    DFieldPresCorrect[id] = currentPresCoeff;
+}
+
+[numthreads(8, 8, 8)]
+void CSPresCorrectRhieChowPreCompute(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (!InRegion(id))
+        return;
+    
+    if (flagField[id] != CELL_FLUID)
+        return;
+
+    int3 P = int3(x, y, z);
+    int3 E = int3(x + 1, y, z);
+    int3 W = int3(x - 1, y, z);
+    int3 N = int3(x, y + 1, z);
+    int3 S = int3(x, y - 1, z);
+    int3 U = int3(x, y, z + 1);
+    int3 D = int3(x, y, z - 1);
+    
+    int3 EE = int3(x + 2, y, z);
+    int3 WW = int3(x - 2, y, z);
+    int3 NN = int3(x, y + 2, z);
+    int3 SS = int3(x, y - 2, z);
+    int3 UU = int3(x, y, z + 2);
+    int3 DD = int3(x, y, z - 2);
+    
+    // Solve the continuity equation to obtain pressure correction.
+    float DPresCorrect = 0;
+    //float currentPresCoeff = 0;
+    float bPresCorrect = 0;
+    //float velTerm = 0;
+    
+    if (InRegion(E))
+    {
+        if (IsFluid(E))
+        {
+            float DInv = 0.5 * (1 / DField[P].x + 1 / DField[E].x);
+        
+            // CDS interpolation
+            DPresCorrect -= (dv / den) * DInv / dx;
+            bPresCorrect += 0.5 * (velField[P].x + velField[E].x);
+        
+            // Rhie-Chow correction
+            float presGrad = (presFieldLastTime[E] - presFieldLastTime[P]) / dx;
+            float presGradAve = 0;
+        
+            if (InRegionAndIsFluid(EE) && InRegionAndIsFluid(W))
+                presGradAve = 0.5 * ((presFieldLastTime[EE] - presFieldLastTime[P]) / (2 * dx) + (presFieldLastTime[E] - presFieldLastTime[W]) / (2 * dx));
+            else if (InRegionAndIsFluid(EE))
+                presGradAve = 0.5 * ((presFieldLastTime[EE] - presFieldLastTime[P]) / (2 * dx) + (presFieldLastTime[E] - presFieldLastTime[P]) / (2 * dx));
+            else if (InRegionAndIsFluid(W))
+                presGradAve = 0.5 * ((presFieldLastTime[E] - presFieldLastTime[P]) / (2 * dx) + (presFieldLastTime[E] - presFieldLastTime[W]) / (2 * dx));
+            else
+                presGradAve = presGrad;
+        
+            float velCorrectTerm = -(dv * DInv) / den * (presGrad - presGradAve);
+            bPresCorrect += velCorrectTerm;
+        }
+        // Solid cell does not need explicit treatment.
+    }
+    else
+    {
+        // ----- Velocity boundary -----
+        if (velBndTypeXn == VEL_BND_FIXED_VALUE)
+            bPresCorrect += bndFieldXn[int2(y, z)].x;
+        else if (velBndTypeXn == VEL_BND_ZERO_GRAD)
+            bPresCorrect += velField[P].x;
+        // Symmetry velocity boundary does not need explicit treatment.
+        
+        // ----- Pressure boundary -----
+        if (presBndTypeXn == PRES_BND_FIXED_VALUE)
+        {
+            float DInv = 1 / DField[P].x;
+            DPresCorrect -= 2 * (dv / den) * DInv / dx;
+        }
+        // Zero-gradient and symmetry pressure boundary do not need explicit treatment.
+    }
+    
+    if (InRegion(W))
+    {
+        if (IsFluid(W))
+        {
+            float DInv = 0.5 * (1 / DField[P].x + 1 / DField[W].x);
+        
+            // CDS interpolation
+            DPresCorrect -= (dv / den) * DInv / dx;
+            bPresCorrect -= 0.5 * (velField[P].x + velField[W].x);
+        
+            // Rhie-Chow correction
+            float presGrad = (presFieldLastTime[P] - presFieldLastTime[W]) / dx;
+            float presGradAve = 0;
+        
+            if (InRegionAndIsFluid(WW) && InRegionAndIsFluid(E))
+                presGradAve = 0.5 * ((presFieldLastTime[E] - presFieldLastTime[W]) / (2 * dx) + (presFieldLastTime[P] - presFieldLastTime[WW]) / (2 * dx));
+            else if (InRegionAndIsFluid(WW))
+                presGradAve = 0.5 * ((presFieldLastTime[P] - presFieldLastTime[W]) / (2 * dx) + (presFieldLastTime[P] - presFieldLastTime[WW]) / (2 * dx));
+            else if (InRegionAndIsFluid(E))
+                presGradAve = 0.5 * ((presFieldLastTime[E] - presFieldLastTime[W]) / (2 * dx) + (presFieldLastTime[P] - presFieldLastTime[W]) / (2 * dx));
+            else
+                presGradAve = presGrad;
+        
+            float velCorrectTerm = -(dv * DInv) / den * (presGrad - presGradAve);
+            bPresCorrect -= velCorrectTerm;
+        }
+    }
+    else
+    {
+        // ----- Velocity boundary -----
+        if (velBndTypeX0 == VEL_BND_FIXED_VALUE)
+            bPresCorrect -= bndFieldX0[int2(y, z)].x;
+        else if (velBndTypeX0 == VEL_BND_ZERO_GRAD)
+            bPresCorrect -= velField[P].x;
+        // Symmetry velocity boundary does not need explicit treatment.
+        
+        // ----- Pressure boundary -----
+        if (presBndTypeX0 == PRES_BND_FIXED_VALUE)
+        {
+            float DInv = 1 / DField[P].x;
+            DPresCorrect -= 2 * (dv / den) * DInv / dx;
+        }
+        // Zero-gradient and symmetry pressure boundary do not need explicit treatment.
+    }
+    
+    if (InRegion(N))
+    {
+        if (IsFluid(N))
+        {
+            float DInv = 0.5 * (1 / DField[P].y + 1 / DField[N].y);
+        
+            // CDS interpolation
+            DPresCorrect -= (dv / den) * DInv / dx;
+            bPresCorrect += 0.5 * (velField[P].y + velField[N].y);
+        
+            // Rhie-Chow correction
+            float presGrad = (presFieldLastTime[N] - presFieldLastTime[P]) / dx;
+            float presGradAve = 0;
+        
+            if (InRegionAndIsFluid(NN) && InRegionAndIsFluid(S))
+                presGradAve = 0.5 * ((presFieldLastTime[NN] - presFieldLastTime[P]) / (2 * dx) + (presFieldLastTime[N] - presFieldLastTime[S]) / (2 * dx));
+            else if (InRegionAndIsFluid(NN))
+                presGradAve = 0.5 * ((presFieldLastTime[NN] - presFieldLastTime[P]) / (2 * dx) + (presFieldLastTime[N] - presFieldLastTime[P]) / (2 * dx));
+            else if (InRegionAndIsFluid(S))
+                presGradAve = 0.5 * ((presFieldLastTime[N] - presFieldLastTime[P]) / (2 * dx) + (presFieldLastTime[N] - presFieldLastTime[S]) / (2 * dx));
+            else
+                presGradAve = presGrad;
+        
+            float velCorrectTerm = -(dv * DInv) / den * (presGrad - presGradAve);
+            bPresCorrect += velCorrectTerm;
+        }
+    }
+    else
+    {
+        // ----- Velocity boundary -----
+        if (velBndTypeYn == VEL_BND_FIXED_VALUE)
+            bPresCorrect += bndFieldYn[int2(x, z)].y;
+        else if (velBndTypeYn == VEL_BND_ZERO_GRAD)
+            bPresCorrect += velField[P].y;
+        // Symmetry velocity boundary does not need explicit treatment.
+        
+        // ----- Pressure boundary -----
+        if (presBndTypeYn == PRES_BND_FIXED_VALUE)
+        {
+            float DInv = 1 / DField[P].y;
+            DPresCorrect -= 2 * (dv / den) * DInv / dx;
+        }
+        // Zero-gradient and symmetry pressure boundary do not need explicit treatment.
+    }
+    
+    if (InRegion(S))
+    {
+        if (IsFluid(S))
+        {
+            float DInv = 0.5 * (1 / DField[P].y + 1 / DField[S].y);
+        
+            // CDS interpolation
+            DPresCorrect -= (dv / den) * DInv / dx;
+            bPresCorrect -= 0.5 * (velField[P].y + velField[S].y);
+        
+            // Rhie-Chow correction
+            float presGrad = (presFieldLastTime[P] - presFieldLastTime[S]) / dx;
+            float presGradAve = 0;
+        
+            if (InRegionAndIsFluid(SS) && InRegionAndIsFluid(N))
+                presGradAve = 0.5 * ((presFieldLastTime[N] - presFieldLastTime[S]) / (2 * dx) + (presFieldLastTime[P] - presFieldLastTime[SS]) / (2 * dx));
+            else if (InRegionAndIsFluid(SS))
+                presGradAve = 0.5 * ((presFieldLastTime[P] - presFieldLastTime[S]) / (2 * dx) + (presFieldLastTime[P] - presFieldLastTime[SS]) / (2 * dx));
+            else if (InRegionAndIsFluid(N))
+                presGradAve = 0.5 * ((presFieldLastTime[N] - presFieldLastTime[S]) / (2 * dx) + (presFieldLastTime[P] - presFieldLastTime[S]) / (2 * dx));
+            else
+                presGradAve = presGrad;
+        
+            float velCorrectTerm = -(dv * DInv) / den * (presGrad - presGradAve);
+            bPresCorrect -= velCorrectTerm;
+        }
+    }
+    else
+    {
+        // ----- Velocity boundary -----
+        if (velBndTypeY0 == VEL_BND_FIXED_VALUE)
+            bPresCorrect -= bndFieldY0[int2(x, z)].y;
+        else if (velBndTypeY0 == VEL_BND_ZERO_GRAD)
+            bPresCorrect -= velField[P].y;
+        // Symmetry velocity boundary does not need explicit treatment.
+        
+        // ----- Pressure boundary -----
+        if (presBndTypeY0 == PRES_BND_FIXED_VALUE)
+        {
+            float DInv = 1 / DField[P].y;
+            DPresCorrect -= 2 * (dv / den) * DInv / dx;
+        }
+        // Zero-gradient and symmetry pressure boundary do not need explicit treatment.
+    }
+    
+    if (InRegion(U))
+    {
+        if (IsFluid(U))
+        {
+            float DInv = 0.5 * (1 / DField[P].z + 1 / DField[U].z);
+        
+            // CDS interpolation
+            DPresCorrect -= (dv / den) * DInv / dx;
+            bPresCorrect += 0.5 * (velField[P].z + velField[U].z);
+        
+            // Rhie-Chow correction
+            float presGrad = (presFieldLastTime[U] - presFieldLastTime[P]) / dx;
+            float presGradAve = 0;
+        
+            if (InRegionAndIsFluid(UU) && InRegionAndIsFluid(D))
+                presGradAve = 0.5 * ((presFieldLastTime[UU] - presFieldLastTime[P]) / (2 * dx) + (presFieldLastTime[U] - presFieldLastTime[D]) / (2 * dx));
+            else if (InRegionAndIsFluid(UU))
+                presGradAve = 0.5 * ((presFieldLastTime[UU] - presFieldLastTime[P]) / (2 * dx) + (presFieldLastTime[U] - presFieldLastTime[P]) / (2 * dx));
+            else if (InRegionAndIsFluid(D))
+                presGradAve = 0.5 * ((presFieldLastTime[U] - presFieldLastTime[P]) / (2 * dx) + (presFieldLastTime[U] - presFieldLastTime[D]) / (2 * dx));
+            else
+                presGradAve = presGrad;
+        
+            float velCorrectTerm = -(dv * DInv) / den * (presGrad - presGradAve);
+            bPresCorrect += velCorrectTerm;
+        }
+    }
+    else
+    {
+        // ----- Velocity boundary -----
+        if (velBndTypeZn == VEL_BND_FIXED_VALUE)
+            bPresCorrect += bndFieldZn[int2(x, y)].z;
+        else if (velBndTypeZn == VEL_BND_ZERO_GRAD)
+            bPresCorrect += velField[P].z;
+        // Symmetry velocity boundary does not need explicit treatment.
+        
+        // ----- Pressure boundary -----
+        if (presBndTypeZn == PRES_BND_FIXED_VALUE)
+        {
+            float DInv = 1 / DField[P].z;
+            DPresCorrect -= 2 * (dv / den) * DInv / dx;
+        }
+        // Zero-gradient and symmetry pressure boundary do not need explicit treatment.
+    }
+    
+    if (InRegion(D))
+    {
+        if (IsFluid(D))
+        {
+            float DInv = 0.5 * (1 / DField[P].z + 1 / DField[D].z);
+        
+            // CDS interpolation
+            DPresCorrect -= (dv / den) * DInv / dx;
+            bPresCorrect -= 0.5 * (velField[P].z + velField[D].z);
+        
+            // Rhie-Chow correction
+            float presGrad = (presFieldLastTime[P] - presFieldLastTime[D]) / dx;
+            float presGradAve = 0;
+        
+            if (InRegionAndIsFluid(DD) && InRegionAndIsFluid(U))
+                presGradAve = 0.5 * ((presFieldLastTime[U] - presFieldLastTime[D]) / (2 * dx) + (presFieldLastTime[P] - presFieldLastTime[DD]) / (2 * dx));
+            else if (InRegionAndIsFluid(DD))
+                presGradAve = 0.5 * ((presFieldLastTime[P] - presFieldLastTime[D]) / (2 * dx) + (presFieldLastTime[P] - presFieldLastTime[DD]) / (2 * dx));
+            else if (InRegionAndIsFluid(U))
+                presGradAve = 0.5 * ((presFieldLastTime[U] - presFieldLastTime[D]) / (2 * dx) + (presFieldLastTime[P] - presFieldLastTime[D]) / (2 * dx));
+            else
+                presGradAve = presGrad;
+        
+            float velCorrectTerm = -(dv * DInv) / den * (presGrad - presGradAve);
+            bPresCorrect -= velCorrectTerm;
+        }
+    }
+    else
+    {
+        // ----- Velocity boundary -----
+        if (velBndTypeZ0 == VEL_BND_FIXED_VALUE)
+            bPresCorrect -= bndFieldZ0[int2(x, y)].z;
+        else if (velBndTypeZ0 == VEL_BND_ZERO_GRAD)
+            bPresCorrect -= velField[P].z;
+        // Symmetry velocity boundary does not need explicit treatment.
+        
+        // ----- Pressure boundary -----
+        if (presBndTypeZ0 == PRES_BND_FIXED_VALUE)
+        {
+            float DInv = 1 / DField[P].z;
+            DPresCorrect -= 2 * (dv / den) * DInv / dx;
+        }
+        // Zero-gradient and symmetry pressure boundary do not need explicit treatment.
+    }
+    
+    //presCorrectField[id] = (1 / currentPresCoeff) * (presCorrectTerm + velTerm);
+    
+    DFieldPresCorrect[id] = DPresCorrect;
+    bFieldPresCorrect[id] = bPresCorrect;
+}
+
+[numthreads(8, 8, 8)]
+void CSPresCorrectRhieChow(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (!InRegion(id))
+        return;
+    
+    if (flagField[id] != CELL_FLUID)
+        return;
+
+    int3 P = int3(x, y, z);
+    int3 E = int3(x + 1, y, z);
+    int3 W = int3(x - 1, y, z);
+    int3 N = int3(x, y + 1, z);
+    int3 S = int3(x, y - 1, z);
+    int3 U = int3(x, y, z + 1);
+    int3 D = int3(x, y, z - 1);
+    
+    // Solve the continuity equation to obtain pressure correction.
+    float presCorrectTerm = 0;
+    
+    if (InRegionAndIsFluid(E))
+    {
+        float DInv = 0.5 * (1 / DField[P].x + 1 / DField[E].x);
+        presCorrectTerm -= (dv / den) * DInv / dx * presCorrectFieldLastIter[E];
+    }
+    
+    if (InRegionAndIsFluid(W))
+    {
+        float DInv = 0.5 * (1 / DField[P].x + 1 / DField[W].x);
+        presCorrectTerm -= (dv / den) * DInv / dx * presCorrectFieldLastIter[W];
+    }
+    
+    if (InRegionAndIsFluid(N))
+    {
+        float DInv = 0.5 * (1 / DField[P].y + 1 / DField[N].y);
+        presCorrectTerm -= (dv / den) * DInv / dx * presCorrectFieldLastIter[N];
+    }
+    
+    if (InRegionAndIsFluid(S))
+    {
+        float DInv = 0.5 * (1 / DField[P].y + 1 / DField[S].y);
+        presCorrectTerm -= (dv / den) * DInv / dx * presCorrectFieldLastIter[S];
+    }
+    
+    if (InRegionAndIsFluid(U))
+    {
+        float DInv = 0.5 * (1 / DField[P].z + 1 / DField[U].z);
+        presCorrectTerm -= (dv / den) * DInv / dx * presCorrectFieldLastIter[U];
+    }
+    
+    if (InRegionAndIsFluid(D))
+    {
+        float DInv = 0.5 * (1 / DField[P].z + 1 / DField[D].z);
+        presCorrectTerm -= (dv / den) * DInv / dx * presCorrectFieldLastIter[D];
+    }
+    
+    presCorrectField[id] = (1 / DFieldPresCorrect[id]) * (presCorrectTerm + bFieldPresCorrect[id]);
+}
+
+[numthreads(8, 8, 8)]
+void CSApplyPresCorrection(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (!InRegion(id))
+        return;
+    
+    if (flagField[int3(x, y, z)] == CELL_SOLID)
+        return;
+    
+    presFieldLastTime[id] += presCorrectField[id];
+}
+
+[numthreads(8, 8, 8)]
+void CSPresNormalization(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (!InRegion(id))
+        return;
+    
+    if (flagField[int3(x, y, z)] == CELL_SOLID)
+        return;
+    
+    //float refPres = presFieldLastTime[int3(gridRes.x / 2, gridRes.y / 2, gridRes.z / 2)];
+    //float refPres = presFieldLastTime[int3(2, 2, 2)];
+    float refPres = presFieldLastTime[int3(2, presRes.y / 2, 2)];
+    
+    presFieldLastTime[id] -= refPres;
+}
+
+[numthreads(8, 8, 8)]
+void CSApplyVelCorrection(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (!InRegion(id))
+        return;
+    
+    if (flagField[int3(x, y, z)] != CELL_FLUID)
+        return;
+    
+    int3 P = int3(x, y, z);
+    int3 E = int3(x + 1, y, z);
+    int3 W = int3(x - 1, y, z);
+    int3 N = int3(x, y + 1, z);
+    int3 S = int3(x, y - 1, z);
+    int3 U = int3(x, y, z + 1);
+    int3 D = int3(x, y, z - 1);
+    
+    float Dx = DField[P].x;
+    float Dy = DField[P].y;
+    float Dz = DField[P].z;
+
+    float velXCorrect = 0, velYCorrect = 0, velZCorrect = 0;
+    
+    if (InRegion(E) == false || flagField[E] == 1)
+    {
+        velXCorrect = -(dv / den) * (1 / Dx) * (presCorrectField[P] - presCorrectField[W]) / dx;
+    }
+    else if (InRegion(W) == false || flagField[W] == 1)
+    {
+        velXCorrect = -(dv / den) * (1 / Dx) * (presCorrectField[E] - presCorrectField[P]) / dx;
+    }
+    else
+    {
+        velXCorrect = -(dv / den) * (1 / Dx) * (presCorrectField[E] - presCorrectField[W]) / (2 * dx);
+    }
+    
+    if (InRegion(N) == false || flagField[N] == 1)
+    {
+        velYCorrect = -(dv / den) * (1 / Dy) * (presCorrectField[P] - presCorrectField[S]) / dx;
+    }
+    else if (InRegion(S) == false || flagField[S] == 1)
+    {
+        velYCorrect = -(dv / den) * (1 / Dy) * (presCorrectField[N] - presCorrectField[P]) / dx;
+    }
+    else
+    {
+        velYCorrect = -(dv / den) * (1 / Dy) * (presCorrectField[N] - presCorrectField[S]) / (2 * dx);
+    }
+    
+    if (InRegion(U) == false || flagField[U] == 1)
+    {
+        velZCorrect = -(dv / den) * (1 / Dz) * (presCorrectField[P] - presCorrectField[D]) / dx;
+    }
+    else if (InRegion(D) == false || flagField[D] == 1)
+    {
+        velZCorrect = -(dv / den) * (1 / Dz) * (presCorrectField[U] - presCorrectField[P]) / dx;
+    }
+    else
+    {
+        velZCorrect = -(dv / den) * (1 / Dz) * (presCorrectField[U] - presCorrectField[D]) / (2 * dx);
+    }
+    
+    velCorrectField[id] = float4(velXCorrect, velYCorrect, velZCorrect, 0.0f);
+    velField[id] += float4(velXCorrect, velYCorrect, velZCorrect, 0.0f);
+}
+
+[numthreads(8, 8, 8)]
+void CSApplyVelCorrectionDivergenceTheorem(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (!InRegion(id))
+        return;
+    
+    if (flagField[int3(x, y, z)] != CELL_FLUID)
+        return;
+    
+    int3 P = int3(x, y, z);
+    int3 E = int3(x + 1, y, z);
+    int3 W = int3(x - 1, y, z);
+    int3 N = int3(x, y + 1, z);
+    int3 S = int3(x, y - 1, z);
+    int3 U = int3(x, y, z + 1);
+    int3 D = int3(x, y, z - 1);
+    
+    float Dx = DField[P].x;
+    float Dy = DField[P].y;
+    float Dz = DField[P].z;
+
+    float velXCorrect = 0, velYCorrect = 0, velZCorrect = 0;
+    
+    float peCorrect = 0, pwCorrect = 0, pnCorrect = 0, psCorrect = 0, puCorrect = 0, pdCorrect = 0;
+    
+    if (InRegion(E))
+    {
+        if (IsFluid(E))
+            peCorrect = 0.5 * (presCorrectField[P] + presCorrectField[E]);
+        else
+            peCorrect = presCorrectField[P];
+    }
+    else
+    {
+        if (presBndTypeXn == PRES_BND_FIXED_VALUE)
+        {
+            peCorrect = 0;
+        }
+        else if (presBndTypeXn == PRES_BND_ZERO_GRAD)
+        {
+            peCorrect = presCorrectField[P];
+        }
+        else if (presBndTypeXn == PRES_BND_SYMMETRY)
+        {
+            peCorrect = presCorrectField[P];
+        }
+    }
+    
+    if (InRegion(W))
+    {
+        if (IsFluid(W))
+            pwCorrect = 0.5 * (presCorrectField[P] + presCorrectField[W]);
+        else
+            pwCorrect = presCorrectField[P];
+    }
+    else
+    {
+        if (presBndTypeX0 == PRES_BND_FIXED_VALUE)
+        {
+            pwCorrect = 0;
+        }
+        else if (presBndTypeX0 == PRES_BND_ZERO_GRAD)
+        {
+            pwCorrect = presCorrectField[P];
+        }
+        else if (presBndTypeX0 == PRES_BND_SYMMETRY)
+        {
+            pwCorrect = presCorrectField[P];
+        }
+    }
+    
+    if (InRegion(N))
+    {
+        if (IsFluid(N))
+            pnCorrect = 0.5 * (presCorrectField[P] + presCorrectField[N]);
+        else
+            pnCorrect = presCorrectField[P];
+    }
+    else
+    {
+        if (presBndTypeYn == PRES_BND_FIXED_VALUE)
+        {
+            pnCorrect = 0;
+        }
+        else if (presBndTypeYn == PRES_BND_ZERO_GRAD)
+        {
+            pnCorrect = presCorrectField[P];
+        }
+        else if (presBndTypeYn == PRES_BND_SYMMETRY)
+        {
+            pnCorrect = presCorrectField[P];
+        }
+    }
+    
+    if (InRegion(S))
+    {
+        if (IsFluid(S))
+            psCorrect = 0.5 * (presCorrectField[P] + presCorrectField[S]);
+        else
+            psCorrect = presCorrectField[P];
+    }
+    else
+    {
+        if (presBndTypeY0 == PRES_BND_FIXED_VALUE)
+        {
+            psCorrect = 0;
+        }
+        else if (presBndTypeY0 == PRES_BND_ZERO_GRAD)
+        {
+            psCorrect = presCorrectField[P];
+        }
+        else if (presBndTypeY0 == PRES_BND_SYMMETRY)
+        {
+            psCorrect = presCorrectField[P];
+        }
+    }
+    
+    if (InRegion(U))
+    {
+        if (IsFluid(U))
+            puCorrect = 0.5 * (presCorrectField[P] + presCorrectField[U]);
+        else
+            puCorrect = presCorrectField[P];
+    }
+    else
+    {
+        if (presBndTypeZn == PRES_BND_FIXED_VALUE)
+        {
+            puCorrect = 0;
+        }
+        else if (presBndTypeZn == PRES_BND_ZERO_GRAD)
+        {
+            puCorrect = presCorrectField[P];
+        }
+        else if (presBndTypeZn == PRES_BND_SYMMETRY)
+        {
+            puCorrect = presCorrectField[P];
+        }
+    }
+    
+    if (InRegion(D))
+    {
+        if (IsFluid(D))
+            pdCorrect = 0.5 * (presCorrectField[P] + presCorrectField[D]);
+        else
+            pdCorrect = presCorrectField[P];
+    }
+    else
+    {
+        if (presBndTypeZ0 == PRES_BND_FIXED_VALUE)
+        {
+            pdCorrect = 0;
+        }
+        else if (presBndTypeZ0 == PRES_BND_ZERO_GRAD)
+        {
+            pdCorrect = presCorrectField[P];
+        }
+        else if (presBndTypeZ0 == PRES_BND_SYMMETRY)
+        {
+            pdCorrect = presCorrectField[P];
+        }
+    }
+    
+    velXCorrect = -(dv / den) * (1 / Dx) * (peCorrect - pwCorrect) / dx;
+    velYCorrect = -(dv / den) * (1 / Dy) * (pnCorrect - psCorrect) / dx;
+    velZCorrect = -(dv / den) * (1 / Dz) * (puCorrect - pdCorrect) / dx;
+    
+    velCorrectField[id] = float4(velXCorrect, velYCorrect, velZCorrect, 0.0f);
+    velField[id] += float4(velXCorrect, velYCorrect, velZCorrect, 0.0f);
+}
+
+[numthreads(8, 8, 8)]
+void CSComputeVelPredictResidual(uint3 id : SV_DispatchThreadID, uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    float3 locRes = float3(0, 0, 0);
+    
+    // Calculate squared residual
+    if (x < gridRes.x && y < gridRes.y && z < gridRes.z)
+    {
+        locRes.x = DField[id].x * (velField[id].x - velFieldLastIter[id].x);
+        locRes.y = DField[id].y * (velField[id].y - velFieldLastIter[id].y);
+        locRes.z = DField[id].z * (velField[id].z - velFieldLastIter[id].z);
+    }
+
+    float locResSumSqu = pow(locRes.x, 2) + pow(locRes.y, 2) + pow(locRes.z, 2);
+    
+    // Store current squared residual
+    uint groupThreadIndex = groupThreadId.z * (groupSize.x * groupSize.y) + groupThreadId.y * groupSize.x + groupThreadId.x;
+    groupResBuf[groupThreadIndex] = locResSumSqu;
+    
+    GroupMemoryBarrierWithGroupSync();
+    
+    // Reduction on current thread group
+    for (uint stride = (groupSize.x * groupSize.y * groupSize.z) / 2; stride > 0; stride /= 2)
+    {
+        if (groupThreadIndex < stride)
+        {
+            groupResBuf[groupThreadIndex] += groupResBuf[groupThreadIndex + stride];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    
+    // Save the current group result to the global buffer
+    if (groupThreadIndex == 0)
+    {
+        int idGloResBuf = groupId.z * (numGroups.x * numGroups.y) + groupId.y * numGroups.x + groupId.x;
+        gloResBuf[idGloResBuf] = groupResBuf[0];
+    }
+}
+
+[numthreads(8, 8, 8)]
+void CSComputePresCorrectResidual(uint3 id : SV_DispatchThreadID, uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    float locRes = 0;
+    
+    // Calculate squared residual
+    if (x < gridRes.x && y < gridRes.y && z < gridRes.z)
+        locRes = DFieldPresCorrect[id] * (presCorrectField[id] - presCorrectFieldLastIter[id]);
+
+    float locResSumSqu = pow(locRes, 2);
+    
+    // Store current squared residual
+    uint groupThreadIndex = groupThreadId.z * (groupSize.x * groupSize.y) + groupThreadId.y * groupSize.x + groupThreadId.x;
+    groupResBuf[groupThreadIndex] = locResSumSqu;
+    
+    GroupMemoryBarrierWithGroupSync();
+    
+    // Reduction on current thread group
+    for (uint stride = (groupSize.x * groupSize.y * groupSize.z) / 2; stride > 0; stride /= 2)
+    {
+        if (groupThreadIndex < stride)
+        {
+            groupResBuf[groupThreadIndex] += groupResBuf[groupThreadIndex + stride];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    
+    // Save the current group result to the global buffer
+    if (groupThreadIndex == 0)
+    {
+        int idGloResBuf = groupId.z * (numGroups.x * numGroups.y) + groupId.y * numGroups.x + groupId.x;
+        gloResBuf[idGloResBuf] = groupResBuf[0];
+    }
+}

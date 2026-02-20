@@ -1,0 +1,34 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSPlayBack
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWStructuredBuffer<float> velFieldBuffer;
+RWStructuredBuffer<float> presFieldBuffer;
+
+RWTexture3D<float4> velFieldTex;
+RWTexture3D<float> presFieldTex;
+
+int3 velRes;
+int3 presRes;
+
+[numthreads(8,8,8)]
+void CSPlayBack (uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (x < velRes.x && y < velRes.y && z < velRes.z)
+    {
+        float4 vel = float4(0, 0, 0, 0);
+        vel.x = velFieldBuffer[(z * (velRes.x * velRes.y) + y * velRes.x + x) * 4];
+        vel.y = velFieldBuffer[(z * (velRes.x * velRes.y) + y * velRes.x + x) * 4 + 1];
+        vel.z = velFieldBuffer[(z * (velRes.x * velRes.y) + y * velRes.x + x) * 4 + 2];
+        
+        velFieldTex[int3(x, y, z)] = vel;
+    }
+    
+    if (x < presRes.x && y < presRes.y && z < presRes.z)
+    {
+        presFieldTex[int3(x, y, z)] = presFieldBuffer[z * (presRes.x * presRes.y) + y * presRes.x + x];
+    }
+}

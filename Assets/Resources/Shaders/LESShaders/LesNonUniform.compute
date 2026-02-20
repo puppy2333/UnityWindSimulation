@@ -1,0 +1,485 @@
+#include "../Includes/Constants.hlsl"
+
+// ----- Kernel declaration -----
+#pragma kernel CSCalEddyVisAndLesDeferCorrectTerm
+
+RWTexture3D<float4> velFieldLastTime;
+Texture3D<int> flagField; // 0 for fluid, 1 for solid
+
+// ----- Grid face position buffers -----
+StructuredBuffer<float> facePosX;
+StructuredBuffer<float> facePosY;
+StructuredBuffer<float> facePosZ;
+
+// ----- Boundary condition textures -----
+// float4: (velX, velY, velZ, unused)
+Texture2D<float4> bndFieldX0;
+Texture2D<float4> bndFieldXn;
+Texture2D<float4> bndFieldY0;
+Texture2D<float4> bndFieldYn;
+Texture2D<float4> bndFieldZ0;
+Texture2D<float4> bndFieldZn;
+
+int3 gridRes;
+float nu;
+
+float cs; // Smagorinsky constant, default value is 0.18
+
+// ----- LES -----
+// Eddy viscosity field for LES simulation.
+RWTexture3D<float> eddyVisField;
+// Field for b in Ax = b in velocity prediction term.
+RWTexture3D<float4> bField;
+
+
+// ----- Return whether the cell with "id" is inside the simulation region -----
+bool InRegion(int3 id)
+{
+    return (id.x >= 0 && id.x < gridRes.x) && (id.y >= 0 && id.y < gridRes.y) && (id.z >= 0 && id.z < gridRes.z);
+}
+
+bool IsFluid(int3 id)
+{
+    return flagField[id] == CELL_FLUID;
+}
+
+bool InRegionAndIsFluid(int3 id)
+{
+    if (InRegion(id))
+        return flagField[id] == CELL_FLUID;
+    else
+        return false;
+}
+
+inline float3 GetEFaceVelLastTime(int3 P)
+{
+    int3 E = P + int3(1, 0, 0);
+    
+    float3 faceVel = 0;
+    if (InRegionAndIsFluid(E))
+    {
+        float dx = facePosX[P.x + 1] - facePosX[P.x];
+        float dxE = facePosX[P.x + 2] - facePosX[P.x + 1];
+        float wP = dxE / (dx + dxE);
+        faceVel = wP * velFieldLastTime[P].xyz + (1.0f - wP) * velFieldLastTime[E].xyz;
+    }
+    else if (!InRegion(E))
+    {
+        faceVel = bndFieldXn[int2(P.y, P.z)].xyz;
+    }
+    
+    return faceVel;
+}
+
+inline float3 GetWFaceVelLastTime(int3 P)
+{
+    int3 W = P - int3(1, 0, 0);
+    
+    float3 faceVel = 0;
+    if (InRegionAndIsFluid(W))
+    {
+        float dx = facePosX[P.x + 1] - facePosX[P.x];
+        float dxW = facePosX[P.x] - facePosX[P.x - 1];
+        float wP = dxW / (dx + dxW);
+        faceVel = wP * velFieldLastTime[P].xyz + (1.0f - wP) * velFieldLastTime[W].xyz;
+    }
+    else if (!InRegion(W))
+    {
+        faceVel = bndFieldX0[int2(P.y, P.z)].xyz;
+    }
+    
+    return faceVel;
+}
+
+inline float3 GetNFaceVelLastTime(int3 P)
+{
+    int3 N = P + int3(0, 1, 0);
+    
+    float3 faceVel = 0;
+    if (InRegionAndIsFluid(N))
+    {
+        float dy = facePosY[P.y + 1] - facePosY[P.y];
+        float dyN = facePosX[P.y + 2] - facePosX[P.y + 1];
+        float wP = dyN / (dy + dyN);
+        faceVel = wP * velFieldLastTime[P].xyz + (1.0f - wP) * velFieldLastTime[N].xyz;
+    }
+    else if (!InRegion(N))
+    {
+        faceVel = bndFieldYn[int2(P.x, P.z)].xyz;
+    }
+    
+    return faceVel;
+}
+
+inline float3 GetSFaceVelLastTime(int3 P)
+{
+    int3 S = P - int3(0, 1, 0);
+    
+    float3 faceVel = 0;
+    if (InRegionAndIsFluid(S))
+    {
+        float dy = facePosY[P.y + 1] - facePosY[P.y];
+        int dyS = facePosY[P.y] - facePosY[P.y - 1];
+        float wP = dyS / (dy + dyS);
+        faceVel = wP * velFieldLastTime[P].xyz + (1.0f - wP) * velFieldLastTime[S].xyz;
+    }
+    else if (!InRegion(S))
+    {
+        faceVel = bndFieldY0[int2(P.x, P.z)].xyz;
+    }
+    
+    return faceVel;
+}
+
+inline float3 GetUFaceVelLastTime(int3 P)
+{
+    int3 U = P + int3(0, 0, 1);
+    
+    float3 faceVel = 0;
+    if (InRegionAndIsFluid(U))
+    {
+        float dz = facePosY[P.z + 1] - facePosY[P.z];
+        int dzU = facePosY[P.z + 2] - facePosY[P.z + 1];
+        float wP = dzU / (dz + dzU);
+        faceVel = wP * velFieldLastTime[P].xyz + (1.0f - wP) * velFieldLastTime[U].xyz;
+    }
+    else if (!InRegion(U))
+    {
+        faceVel = bndFieldZn[int2(P.x, P.y)].xyz;
+    }
+    
+    return faceVel;
+}
+
+inline float3 GetDFaceVelLastTime(int3 P)
+{
+    int3 D = P - int3(0, 0, 1);
+    
+    float3 faceVel = 0;
+    if (InRegionAndIsFluid(D))
+    {
+        float dz = facePosY[P.z + 1] - facePosY[P.z];
+        int dzD = facePosY[P.z] - facePosY[P.z - 1];
+        float wP = dzD / (dz + dzD);
+        faceVel = wP * velFieldLastTime[P].xyz + (1.0f - wP) * velFieldLastTime[D].xyz;
+    }
+    else if (!InRegion(D))
+    {
+        faceVel = bndFieldZ0[int2(P.x, P.y)].xyz;
+    }
+    
+    return faceVel;
+}
+
+// ----- Computes and store eddy viscosity, computes and store the deferred correction viscous 
+// term for LES -----
+// grad(u)^T introduces (du/dx)_ew, (dv/dx)_ns, (dw/dx)_ud in U momentum equation. Those terms are
+// put into the b term (explicity) rather than in the A matrix (implicitly). There are two reasons 
+// for doing so: 
+// 1. In decoupled solvers (solve U, V, W momentum equations separately), (dv/dx)_ns term cannot 
+// be solved implictly, therefore they must be put into b term, 
+// 2. Putting them into A matrix adds some additional terms to the non-diagonal entries, making the 
+// matrix less diagonally dominant.
+// 
+// Implementation:
+// (dv/dx)_ns and (dw/dx)_ud are hard to compute. So we first compute them on the cell center, then
+// interpolate them to the faces.
+// The resulting eddy viscosity is stored in eddyVisField, and the deferred correction term in 
+// bField.
+[numthreads(8, 8, 8)]
+void CSCalEddyVisAndLesDeferCorrectTerm(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (!InRegion(id))
+        return;
+    
+    if (flagField[int3(x, y, z)] != CELL_FLUID)
+        return;
+    
+    int3 P = int3(x, y, z);
+    int3 E = int3(x + 1, y, z);
+    int3 W = int3(x - 1, y, z);
+    int3 N = int3(x, y + 1, z);
+    int3 S = int3(x, y - 1, z);
+    int3 U = int3(x, y, z + 1);
+    int3 D = int3(x, y, z - 1);
+    
+    // Grid spacings
+    float dx = facePosX[x + 1] - facePosX[x];
+    float dy = facePosY[y + 1] - facePosY[y];
+    float dz = facePosZ[z + 1] - facePosZ[z];
+    float dsx = dy * dz; // Area of surface perpendicular to x
+    float dsy = dx * dz; // Area of surface perpendicular to y
+    float dsz = dx * dy; // Area of surface perpendicular to z
+    float dv = dx * dy * dz;
+    
+    // Neighbor grid spacings
+    float dxE = dx, dxW = dx, dyN = dy, dyS = dy, dzU = dz, dzD = dz;
+    if (InRegion(E))
+        dxE = facePosX[x + 2] - facePosX[x + 1];
+    if (InRegion(W))
+        dxW = facePosX[x] - facePosX[x - 1];
+    if (InRegion(N))
+        dyN = facePosY[y + 2] - facePosY[y + 1];
+    if (InRegion(S))
+        dyS = facePosY[y] - facePosY[y - 1];
+    if (InRegion(U))
+        dzU = facePosZ[z + 2] - facePosZ[z + 1];
+    if (InRegion(D))
+        dzD = facePosZ[z] - facePosZ[z - 1];
+    
+    // ----- Linear interpolation weights -----
+    // Naming convention:
+    // wPe = weight for P cell east face interpolation
+    // wE = weight for E cell interpolation (for the face between E and P, west face in this case)
+    float wPe = dxE / (dx + dxE);
+    float wE = 1.0f - wPe;
+    
+    float wPw = dxW / (dx + dxW);
+    float wW = 1.0f - wPw;
+    
+    float wPn = dyN / (dy + dyN);
+    float wN = 1.0f - wPn;
+    
+    float wPs = dyS / (dy + dyS);
+    float wS = 1.0f - wPs;
+    
+    float wPu = dzU / (dz + dzU);
+    float wU = 1.0f - wPu;
+    
+    float wPd = dzD / (dz + dzD);
+    float wD = 1.0f - wPd;
+    
+    // ----- Calculate face velocities (current cell) -----
+    float3 velEFace = GetEFaceVelLastTime(P);
+    float3 velWFace = GetWFaceVelLastTime(P);
+    float3 velNFace = GetNFaceVelLastTime(P);
+    float3 velSFace = GetSFaceVelLastTime(P);
+    float3 velUFace = GetUFaceVelLastTime(P);
+    float3 velDFace = GetDFaceVelLastTime(P);
+    
+    // ----- Calculate velocity gradients (current cell) -----
+    // Naming: puxpx == partial ux / partial x
+    float puxpx = (velEFace.x - velWFace.x) / dx;
+    float puxpy = (velNFace.x - velSFace.x) / dy;
+    float puxpz = (velUFace.x - velDFace.x) / dz;
+    
+    float puypx = (velEFace.y - velWFace.y) / dx;
+    float puypy = (velNFace.y - velSFace.y) / dy;
+    float puypz = (velUFace.y - velDFace.y) / dz;
+    
+    float puzpx = (velEFace.z - velWFace.z) / dx;
+    float puzpy = (velNFace.z - velSFace.z) / dy;
+    float puzpz = (velUFace.z - velDFace.z) / dz;
+    
+    // ----- Calculate strain rate tensor -----
+    // Formula: Sij = 0.5 * (dui/dxj + duj/dxi)
+    float Sxx = puxpx;
+    float Syy = puypy;
+    float Szz = puzpz;
+    
+    float Sxy = 0.5f * (puxpy + puypx);
+    float Syz = 0.5f * (puypz + puzpy);
+    float Szx = 0.5f * (puzpx + puxpz);
+    
+    // ----- Calculate eddy viscosity -----
+    float Sabs = sqrt(2.0f * (Sxx * Sxx + Syy * Syy + Szz * Szz + 2.0f * Sxy * Sxy + 2.0f * Syz * Syz + 2.0f * Szx * Szx));
+    float eddyVis = (cs * cs) * (dx * dx) * Sabs;
+    
+    // ----- Calculate the constant terms in momentum equations -----
+    float bTermULes = 0, bTermVLes = 0, bTermWLes = 0;
+    
+    float eFacePuxpx, eFacePuxpy, eFacePuxpz;
+    float wFacePuxpx, wFacePuxpy, wFacePuxpz;
+    float nFacePuypx, nFacePuypy, nFacePuypz;
+    float sFacePuypx, sFacePuypy, sFacePuypz;
+    float uFacePuzpx, uFacePuzpy, uFacePuzpz;
+    float dFacePuzpx, dFacePuzpy, dFacePuzpz;
+    
+    if (InRegionAndIsFluid(E))
+    {
+        // ----- Calculate face velocities (E cell) -----
+        float3 eCellVelEFace = GetEFaceVelLastTime(E);
+        float3 eCellVelWFace = GetWFaceVelLastTime(E);
+        float3 eCellVelNFace = GetNFaceVelLastTime(E);
+        float3 eCellVelSFace = GetSFaceVelLastTime(E);
+        float3 eCellVelUFace = GetUFaceVelLastTime(E);
+        float3 eCellVelDFace = GetDFaceVelLastTime(E);
+    
+        // ----- Calculate velocity gradients (E cell) -----
+        float eCellPuxpx = (eCellVelEFace.x - eCellVelWFace.x) / dx;
+        float eCellPuxpy = (eCellVelNFace.x - eCellVelSFace.x) / dy;
+        float eCellPuxpz = (eCellVelUFace.x - eCellVelDFace.x) / dz;
+        
+        eFacePuxpx = wPe * puxpx + wE * eCellPuxpx;
+        eFacePuxpy = wPe * puxpy + wE * eCellPuxpy;
+        eFacePuxpz = wPe * puxpz + wE * eCellPuxpz;
+    }
+    else
+    {
+        // This might not be accurate for Neumann boundary condition, but acceptable for LES deferred correction term.
+        eFacePuxpx = 0;
+        eFacePuxpy = 0;
+        eFacePuxpz = 0;
+    }
+    
+    if (InRegionAndIsFluid(W))
+    {
+        // ----- Calculate face velocities (W cell) -----
+        float3 wCellVelEFace = GetEFaceVelLastTime(W);
+        float3 wCellVelWFace = GetWFaceVelLastTime(W);
+        float3 wCellVelNFace = GetNFaceVelLastTime(W);
+        float3 wCellVelSFace = GetSFaceVelLastTime(W);
+        float3 wCellVelUFace = GetUFaceVelLastTime(W);
+        float3 wCellVelDFace = GetDFaceVelLastTime(W);
+    
+        // ----- Calculate velocity gradients (W cell) -----
+        float wCellPuxpx = (wCellVelEFace.x - wCellVelWFace.x) / dx;
+        float wCellPuxpy = (wCellVelNFace.x - wCellVelSFace.x) / dy;
+        float wCellPuxpz = (wCellVelUFace.x - wCellVelDFace.x) / dz;
+        
+        wFacePuxpx = wPw * puxpx + wW * wCellPuxpx;
+        wFacePuxpy = wPw * puxpy + wW * wCellPuxpy;
+        wFacePuxpz = wPw * puxpz + wW * wCellPuxpz;
+    }
+    else
+    {
+        wFacePuxpx = 0;
+        wFacePuxpy = 0;
+        wFacePuxpz = 0;
+    }
+    
+    if (InRegionAndIsFluid(N))
+    {
+        // ----- Calculate face velocities (N cell) -----
+        float3 nCellVelEFace = GetEFaceVelLastTime(N);
+        float3 nCellVelWFace = GetWFaceVelLastTime(N);
+        float3 nCellVelNFace = GetNFaceVelLastTime(N);
+        float3 nCellVelSFace = GetSFaceVelLastTime(N);
+        float3 nCellVelUFace = GetUFaceVelLastTime(N);
+        float3 nCellVelDFace = GetDFaceVelLastTime(N);
+    
+        // ----- Calculate velocity gradients (N cell) -----
+        float nCellPuypx = (nCellVelEFace.y - nCellVelWFace.y) / dx;
+        float nCellPuypy = (nCellVelNFace.y - nCellVelSFace.y) / dy;
+        float nCellPuypz = (nCellVelUFace.y - nCellVelDFace.y) / dz;
+        
+        nFacePuypx = wPn * puypx + wN * nCellPuypx;
+        nFacePuypy = wPn * puypy + wN * nCellPuypy;
+        nFacePuypz = wPn * puypz + wN * nCellPuypz;
+    }
+    else
+    {
+        nFacePuypx = 0;
+        nFacePuypy = 0;
+        nFacePuypz = 0;
+    }
+    
+    if (InRegionAndIsFluid(S))
+    {
+        // ----- Calculate face velocities (S cell) -----
+        float3 sCellVelEFace = GetEFaceVelLastTime(S);
+        float3 sCellVelWFace = GetWFaceVelLastTime(S);
+        float3 sCellVelNFace = GetNFaceVelLastTime(S);
+        float3 sCellVelSFace = GetSFaceVelLastTime(S);
+        float3 sCellVelUFace = GetUFaceVelLastTime(S);
+        float3 sCellVelDFace = GetDFaceVelLastTime(S);
+    
+        // ----- Calculate velocity gradients (S cell) -----
+        float sCellPuypx = (sCellVelEFace.y - sCellVelWFace.y) / dx;
+        float sCellPuypy = (sCellVelNFace.y - sCellVelSFace.y) / dy;
+        float sCellPuypz = (sCellVelUFace.y - sCellVelDFace.y) / dz;
+        
+        sFacePuypx = wPs * puypx + wS * sCellPuypx;
+        sFacePuypy = wPs * puypy + wS * sCellPuypy;
+        sFacePuypz = wPs * puypz + wS * sCellPuypz;
+    }
+    else
+    {
+        sFacePuypx = 0;
+        sFacePuypy = 0;
+        sFacePuypz = 0;
+    }
+    
+    if (InRegionAndIsFluid(U))
+    {
+        // ----- Calculate face velocities (U cell) -----
+        float3 uCellVelEFace = GetEFaceVelLastTime(U);
+        float3 uCellVelWFace = GetWFaceVelLastTime(U);
+        float3 uCellVelNFace = GetNFaceVelLastTime(U);
+        float3 uCellVelSFace = GetSFaceVelLastTime(U);
+        float3 uCellVelUFace = GetUFaceVelLastTime(U);
+        float3 uCellVelDFace = GetDFaceVelLastTime(U);
+    
+        // ----- Calculate velocity gradients (U cell) -----
+        float uCellPuzpx = (uCellVelEFace.z - uCellVelWFace.z) / dx;
+        float uCellPuzpy = (uCellVelNFace.z - uCellVelSFace.z) / dy;
+        float uCellPuzpz = (uCellVelUFace.z - uCellVelDFace.z) / dz;
+        
+        uFacePuzpx = wPu * puzpx + wU * uCellPuzpx;
+        uFacePuzpy = wPu * puzpy + wU * uCellPuzpy;
+        uFacePuzpz = wPu * puzpz + wU * uCellPuzpz;
+    }
+    else
+    {
+        uFacePuzpx = 0;
+        uFacePuzpy = 0;
+        uFacePuzpz = 0;
+    }
+    
+    if (InRegionAndIsFluid(D))
+    {
+        // ----- Calculate face velocities (D cell) -----
+        float3 dCellVelEFace = GetEFaceVelLastTime(D);
+        float3 dCellVelWFace = GetWFaceVelLastTime(D);
+        float3 dCellVelNFace = GetNFaceVelLastTime(D);
+        float3 dCellVelSFace = GetSFaceVelLastTime(D);
+        float3 dCellVelUFace = GetUFaceVelLastTime(D);
+        float3 dCellVelDFace = GetDFaceVelLastTime(D);
+    
+        // ----- Calculate velocity gradients (D cell) -----
+        float dCellPuzpx = (dCellVelEFace.z - dCellVelWFace.z) / dx;
+        float dCellPuzpy = (dCellVelNFace.z - dCellVelSFace.z) / dy;
+        float dCellPuzpz = (dCellVelUFace.z - dCellVelDFace.z) / dz;
+        
+        dFacePuzpx = wPd * puzpx + wD * dCellPuzpx;
+        dFacePuzpy = wPd * puzpy + wD * dCellPuzpy;
+        dFacePuzpz = wPd * puzpz + wD * dCellPuzpz;
+    }
+    else
+    {
+        dFacePuzpx = 0;
+        dFacePuzpy = 0;
+        dFacePuzpz = 0;
+    }
+    
+    // ----- Calculate face viscosities with eddy viscosity included -----    
+    float visEFace = nu, visWFace = nu, visNFace = nu, visSFace = nu, visUFace = nu, visDFace = nu;
+    visEFace = nu + eddyVisField[P];
+    visWFace = nu + eddyVisField[P];
+    visNFace = nu + eddyVisField[P];
+    visSFace = nu + eddyVisField[P];
+    visUFace = nu + eddyVisField[P];
+    visDFace = nu + eddyVisField[P];
+    if (InRegionAndIsFluid(E))
+        visEFace = nu + wPe * eddyVisField[P] + wE * eddyVisField[E];
+    if (InRegionAndIsFluid(W))
+        visWFace = nu + wPw * eddyVisField[P] + wW * eddyVisField[W];
+    if (InRegionAndIsFluid(N))
+        visNFace = nu + wPn * eddyVisField[P] + wN * eddyVisField[N];
+    if (InRegionAndIsFluid(S))
+        visSFace = nu + wPs * eddyVisField[P] + wS * eddyVisField[S];
+    if (InRegionAndIsFluid(U))
+        visUFace = nu + wPu * eddyVisField[P] + wU * eddyVisField[U];
+    if (InRegionAndIsFluid(D))
+        visDFace = nu + wPd * eddyVisField[P] + wD * eddyVisField[D];
+        
+    bTermULes += dsx * (visEFace * eFacePuxpx - visWFace * wFacePuxpx + visNFace * nFacePuypx - visSFace * sFacePuypx + visUFace * uFacePuzpx - visDFace * dFacePuzpx);
+    bTermVLes += dsy * (visEFace * eFacePuxpy - visWFace * wFacePuxpy + visNFace * nFacePuypy - visSFace * sFacePuypy + visUFace * uFacePuzpy - visDFace * dFacePuzpy);
+    bTermWLes += dsz * (visEFace * eFacePuxpz - visWFace * wFacePuxpz + visNFace * nFacePuypz - visSFace * sFacePuypz + visUFace * uFacePuzpz - visDFace * dFacePuzpz);
+    
+    // ----- Write textures -----
+    eddyVisField[id] = eddyVis;
+    bField[id] = float4(bTermULes, bTermVLes, bTermWLes, 0.0f);
+}

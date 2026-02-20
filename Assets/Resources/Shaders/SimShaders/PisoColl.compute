@@ -1,0 +1,337 @@
+#include "../Includes/Constants.hlsl"
+
+#pragma kernel CSPisoCalAodUCorrect
+#pragma kernel CSPisoPresCorrection
+#pragma kernel CSPisoApplyPresCorrection
+#pragma kernel CSPisoVelCorrection
+
+RWTexture3D<float4> velField;
+RWTexture3D<float4> velFieldLastTime;
+RWTexture3D<float4> velFieldLastIter;
+RWTexture3D<float4> velCorrectField;
+
+RWTexture3D<float> presFieldLastTime;
+RWTexture3D<float> presCorrectField;
+RWTexture3D<float> presCorrectFieldLastIter;
+
+RWTexture3D<int> flagField; // 0 for fluid, 1 for solid
+
+// Diagonal terms of the velocity prediction coefficient matrix.
+RWTexture3D<float4> DField;
+
+// Diagonal terms of pressure correction coefficient matrix, filled in pressure solver, used in 
+// residual calculation.
+RWTexture3D<float> presDiagAField;
+
+// Buffer with size numGroupX * numGroupY * numGroupZ. Used to store the velocity / pressure 
+// matrix residual of each thread group.
+RWStructuredBuffer<float> gloResBuf;
+
+// Aod * U correction field for PISO.
+RWTexture3D<float4> AodUCorrectField;
+
+// ----- Boundary condition textures -----
+// float4: (velX, velY, velZ, unused)
+//Texture2D<float4> bndX0;
+//Texture2D<float4> bndXn;
+//Texture2D<float4> bndY0;
+//Texture2D<float4> bndYn;
+//Texture2D<float4> bndZ0;
+//Texture2D<float4> bndZn;
+
+int3 gridRes;
+float dt;
+float dx;
+float ds;
+float dv;
+float nu;
+float den;
+float3 externalForce;
+
+// ----- Return whether the cell with "id" is inside the simulation region -----
+bool InRegion(int3 id)
+{
+    return (id.x >= 0 && id.x < gridRes.x) && (id.y >= 0 && id.y < gridRes.y) && (id.z >= 0 && id.z < gridRes.z);
+}
+
+bool InRegionAndIsFluid(int3 id)
+{
+    if (InRegion(id))
+        return flagField[id] == CELL_FLUID;
+    else
+        return false;
+}
+
+// Computes Aod * U, which is needed in the PISO iteration. Ad is not recomputed here, as 
+// according to picard iteration, uu ~= u'u, u' is the velocity in the last outer loop. If one
+// outer loop is understood as one SIMPLE iteration (which contains multiple PISO iteration), then
+// Ad do not needs to be recomputed here. If one outer loop is understood as one PISO iteration, 
+// then Ad needs to be recomputed here. This implementation follows the first understanding.
+[numthreads(8, 8, 8)]
+void CSPisoCalAodUCorrect(uint3 id : SV_DispatchThreadID, uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (!InRegionAndIsFluid(id))
+        return;
+    
+    float UAdvectTerm = 0, UDiffTerm = 0;
+    float VAdvectTerm = 0, VDiffTerm = 0;
+    float WAdvectTerm = 0, WDiffTerm = 0;
+    
+    int3 P = int3(x, y, z);
+    int3 E = int3(x + 1, y, z);
+    int3 W = int3(x - 1, y, z);
+    int3 N = int3(x, y + 1, z);
+    int3 S = int3(x, y - 1, z);
+    int3 U = int3(x, y, z + 1);
+    int3 D = int3(x, y, z - 1);
+    
+    // Calculate the advection term. Picard iteration is used.
+    // ue' * ue, ve' * ue, we' * ue
+    if (InRegionAndIsFluid(E))
+    {
+        UAdvectTerm += ds * 0.25 * velCorrectField[E].x * (velFieldLastTime[P].x + velFieldLastTime[E].x);
+        VAdvectTerm += ds * 0.25 * velCorrectField[E].y * (velFieldLastTime[P].x + velFieldLastTime[E].x);
+        WAdvectTerm += ds * 0.25 * velCorrectField[E].z * (velFieldLastTime[P].x + velFieldLastTime[E].x);
+    }
+    // uw' * uw, vw' * uw, vw' * uw
+    if (InRegionAndIsFluid(W))
+    {
+        UAdvectTerm -= ds * 0.25 * velCorrectField[W].x * (velFieldLastTime[P].x + velFieldLastTime[W].x);
+        VAdvectTerm -= ds * 0.25 * velCorrectField[W].y * (velFieldLastTime[P].x + velFieldLastTime[W].x);
+        WAdvectTerm -= ds * 0.25 * velCorrectField[W].z * (velFieldLastTime[P].x + velFieldLastTime[W].x);
+    }
+    // un' * vn, vn' * vn, wn' * vn
+    if (InRegionAndIsFluid(N))
+    {
+        UAdvectTerm += ds * 0.25 * velCorrectField[N].x * (velFieldLastTime[P].y + velFieldLastTime[N].y);
+        VAdvectTerm += ds * 0.25 * velCorrectField[N].y * (velFieldLastTime[P].y + velFieldLastTime[N].y);
+        WAdvectTerm += ds * 0.25 * velCorrectField[N].z * (velFieldLastTime[P].y + velFieldLastTime[N].y);
+    }
+    // us' * vs, vs' * vs, ws' * vs
+    if (InRegionAndIsFluid(S))
+    {
+        UAdvectTerm -= ds * 0.25 * velCorrectField[S].x * (velFieldLastTime[P].y + velFieldLastTime[S].y);
+        VAdvectTerm -= ds * 0.25 * velCorrectField[S].y * (velFieldLastTime[P].y + velFieldLastTime[S].y);
+        WAdvectTerm -= ds * 0.25 * velCorrectField[S].z * (velFieldLastTime[P].y + velFieldLastTime[S].y);
+    }
+    // uu' * wu, vu' * wu, wu' * wu
+    if (InRegionAndIsFluid(U))
+    {
+        UAdvectTerm += ds * 0.25 * velCorrectField[U].x * (velFieldLastTime[P].z + velFieldLastTime[U].z);
+        VAdvectTerm += ds * 0.25 * velCorrectField[U].y * (velFieldLastTime[P].z + velFieldLastTime[U].z);
+        WAdvectTerm += ds * 0.25 * velCorrectField[U].z * (velFieldLastTime[P].z + velFieldLastTime[U].z);
+    }
+    // ud' * wd, vd' * wd, wd' * wd
+    if (InRegionAndIsFluid(D))
+    {
+        UAdvectTerm -= ds * 0.25 * velCorrectField[D].x * (velFieldLastTime[P].z + velFieldLastTime[D].z);
+        VAdvectTerm -= ds * 0.25 * velCorrectField[D].y * (velFieldLastTime[P].z + velFieldLastTime[D].z);
+        WAdvectTerm -= ds * 0.25 * velCorrectField[D].z * (velFieldLastTime[P].z + velFieldLastTime[D].z);
+    }
+    
+    // Calculate the diffusion term for U component
+    if (InRegionAndIsFluid(E))
+    {
+        UDiffTerm -= nu * ds / dx * velCorrectField[E].x;
+        VDiffTerm -= nu * ds / dx * velCorrectField[E].y;
+        WDiffTerm -= nu * ds / dx * velCorrectField[E].z;
+    }
+    if (InRegionAndIsFluid(W))
+    {
+        UDiffTerm -= nu * ds / dx * velCorrectField[W].x;
+        VDiffTerm -= nu * ds / dx * velCorrectField[W].y;
+        WDiffTerm -= nu * ds / dx * velCorrectField[W].z;
+    }
+    if (InRegionAndIsFluid(N))
+    {
+        UDiffTerm -= nu * ds / dx * velCorrectField[N].x;
+        VDiffTerm -= nu * ds / dx * velCorrectField[N].y;
+        WDiffTerm -= nu * ds / dx * velCorrectField[N].z;
+    }
+    if (InRegionAndIsFluid(S))
+    {
+        UDiffTerm -= nu * ds / dx * velCorrectField[S].x;
+        VDiffTerm -= nu * ds / dx * velCorrectField[S].y;
+        WDiffTerm -= nu * ds / dx * velCorrectField[S].z;
+    }
+    if (InRegionAndIsFluid(U))
+    {
+        UDiffTerm -= nu * ds / dx * velCorrectField[U].x;
+        VDiffTerm -= nu * ds / dx * velCorrectField[U].y;
+        WDiffTerm -= nu * ds / dx * velCorrectField[U].z;
+    }
+    if (InRegionAndIsFluid(D))
+    {
+        UDiffTerm -= nu * ds / dx * velCorrectField[D].x;
+        VDiffTerm -= nu * ds / dx * velCorrectField[D].y;
+        WDiffTerm -= nu * ds / dx * velCorrectField[D].z;
+    }
+    
+    // Calculate the final predicted velocities.
+    float AodUPredict = UAdvectTerm + UDiffTerm;
+    float AodVPredict = VAdvectTerm + VDiffTerm;
+    float AodWPredict = WAdvectTerm + WDiffTerm;
+    
+    AodUCorrectField[id] = float4(AodUPredict, AodVPredict, AodWPredict, 0.0f);
+}
+
+[numthreads(8, 8, 8)]
+void CSPisoPresCorrection(uint3 id : SV_DispatchThreadID, uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (!InRegionAndIsFluid(id))
+        return;
+    
+    int3 P = int3(x, y, z);
+    int3 E = int3(x + 1, y, z);
+    int3 W = int3(x - 1, y, z);
+    int3 N = int3(x, y + 1, z);
+    int3 S = int3(x, y - 1, z);
+    int3 U = int3(x, y, z + 1);
+    int3 D = int3(x, y, z - 1);
+    
+    float presCoeff = 0;
+    float presTerm = 0;
+    float velTerm = 0;
+    
+    if (InRegionAndIsFluid(E))
+    {
+        float AdInv = 0.5 * (1 / DField[P].x + 1 / DField[E].x);
+        float AodUCorrect = 0.5 * (AodUCorrectField[P].x + AodUCorrectField[E].x);
+        
+        presCoeff -= (dv / den) * (AdInv / dx);
+        presTerm -= (dv / den) * (AdInv / dx) * presCorrectFieldLastIter[E];
+        velTerm -= AdInv * AodUCorrect;
+    }
+    if (InRegionAndIsFluid(W))
+    {
+        float AdInv = 0.5 * (1 / DField[P].x + 1 / DField[W].x);
+        float AodUCorrect = 0.5 * (AodUCorrectField[P].x + AodUCorrectField[W].x);
+        
+        presCoeff -= (dv / den) * (AdInv / dx);
+        presTerm -= (dv / den) * (AdInv / dx) * presCorrectFieldLastIter[W];
+        velTerm += AdInv * AodUCorrect;
+    }
+    if (InRegionAndIsFluid(N))
+    {
+        float AdInv = 0.5 * (1 / DField[P].y + 1 / DField[N].y);
+        float AodUCorrect = 0.5 * (AodUCorrectField[P].y + AodUCorrectField[N].y);
+        
+        presCoeff -= (dv / den) * AdInv / dx;
+        presTerm -= (dv / den) * AdInv / dx * presCorrectFieldLastIter[N];
+        velTerm -= AdInv * AodUCorrect;
+    }
+    if (InRegionAndIsFluid(S))
+    {
+        float AdInv = 0.5 * (1 / DField[P].y + 1 / DField[S].y);
+        float AodUCorrect = 0.5 * (AodUCorrectField[P].y + AodUCorrectField[S].y);
+        
+        presCoeff -= (dv / den) * AdInv / dx;
+        presTerm -= (dv / den) * AdInv / dx * presCorrectFieldLastIter[S];
+        velTerm += AdInv * AodUCorrect;
+    }
+    if (InRegionAndIsFluid(U))
+    {
+        float AdInv = 0.5 * (1 / DField[P].z + 1 / DField[U].z);
+        float AodUCorrect = 0.5 * (AodUCorrectField[P].z + AodUCorrectField[U].z);
+        
+        presCoeff -= (dv / den) * AdInv / dx;
+        presTerm -= (dv / den) * AdInv / dx * presCorrectFieldLastIter[U];
+        velTerm -= AdInv * AodUCorrect;
+    }
+    if (InRegionAndIsFluid(D))
+    {
+        float AdInv = 0.5 * (1 / DField[P].z + 1 / DField[D].z);
+        float AodUCorrect = 0.5 * (AodUCorrectField[P].z + AodUCorrectField[D].z);
+        
+        presCoeff -= (dv / den) * AdInv / dx;
+        presTerm -= (dv / den) * AdInv / dx * presCorrectFieldLastIter[D];
+        velTerm += AdInv * AodUCorrect;
+    }
+
+    presCorrectField[id] = (1 / presCoeff) * (presTerm + velTerm);
+}
+
+[numthreads(8, 8, 8)]
+void CSPisoApplyPresCorrection(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (!InRegionAndIsFluid(id))
+        return;
+    
+    presFieldLastTime[id] += presCorrectField[id];
+}
+
+[numthreads(8, 8, 8)]
+void CSPisoVelCorrection(uint3 id : SV_DispatchThreadID, uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (!InRegion(id))
+        return;
+    
+    if (flagField[int3(x, y, z)] != CELL_FLUID)
+        return;
+    
+    int3 P = int3(x, y, z);
+    int3 E = int3(x + 1, y, z);
+    int3 W = int3(x - 1, y, z);
+    int3 N = int3(x, y + 1, z);
+    int3 S = int3(x, y - 1, z);
+    int3 U = int3(x, y, z + 1);
+    int3 D = int3(x, y, z - 1);
+    
+    float DxInv = 1 / DField[P].x;
+    float DyInv = 1 / DField[P].y;
+    float DzInv = 1 / DField[P].z;
+    
+    float pCorrectGradX = 0, pCorrectGradY = 0, pCorrectGradZ = 0;
+    
+    float peCorrect = 0, pwCorrect = 0, pnCorrect = 0, psCorrect = 0, puCorrect = 0, pdCorrect = 0;
+    
+    if (InRegionAndIsFluid(E))
+        peCorrect = 0.5 * (presCorrectField[P] + presCorrectField[E]);
+    else
+        peCorrect = presCorrectField[P];
+    
+    if (InRegionAndIsFluid(W))
+        pwCorrect = 0.5 * (presCorrectField[P] + presCorrectField[W]);
+    else
+        pwCorrect = presCorrectField[P];
+    
+    if (InRegionAndIsFluid(N))
+        pnCorrect = 0.5 * (presCorrectField[P] + presCorrectField[N]);
+    else
+        pnCorrect = presCorrectField[P];
+    
+    if (InRegionAndIsFluid(S))
+        psCorrect = 0.5 * (presCorrectField[P] + presCorrectField[S]);
+    else
+        psCorrect = presCorrectField[P];
+    
+    if (InRegionAndIsFluid(U))
+        puCorrect = 0.5 * (presCorrectField[P] + presCorrectField[U]);
+    else
+        puCorrect = presCorrectField[P];
+    
+    if (InRegionAndIsFluid(D))
+        pdCorrect = 0.5 * (presCorrectField[P] + presCorrectField[D]);
+    else
+        pdCorrect = presCorrectField[P];
+    
+    pCorrectGradX = (peCorrect - pwCorrect) / dx;
+    pCorrectGradY = (pnCorrect - psCorrect) / dx;
+    pCorrectGradZ = (puCorrect - pdCorrect) / dx;
+    
+    float velXCorrect = -DxInv * (AodUCorrectField[id].x + dv / den * pCorrectGradX);
+    float velYCorrect = -DyInv * (AodUCorrectField[id].y + dv / den * pCorrectGradY);
+    float velZCorrect = -DzInv * (AodUCorrectField[id].z + dv / den * pCorrectGradZ);
+    
+    velCorrectField[id] = float4(velXCorrect, velYCorrect, velZCorrect, 0);
+    
+    velField[id] += float4(velXCorrect, velYCorrect, velZCorrect, 0);
+}

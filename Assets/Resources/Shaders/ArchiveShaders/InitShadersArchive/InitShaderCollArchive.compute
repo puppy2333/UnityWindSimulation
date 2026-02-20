@@ -1,0 +1,63 @@
+#include "../../Includes/Constants.hlsl"
+
+#pragma kernel CSInitLidDrivenCavityFlowBndCond
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWTexture3D<float4> velField;
+RWTexture3D<float4> velFieldLastTime;
+RWTexture3D<float4> velFieldLastIter;
+
+RWTexture3D<float> presFieldLastTime;
+RWTexture3D<float> presCorrectField;
+RWTexture3D<float> presCorrectFieldLastIter;
+
+RWTexture3D<int> flagField; // 0 for fluid, 1 for solid
+RWStructuredBuffer<int> flagFieldBuffer;
+
+int3 gridRes;
+float Umax;
+int2 R;
+int2 jetCenter;
+
+[numthreads(8, 8, 8)]
+void CSInitJetFlowBndCond(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (x >= int(gridRes.x) || y >= int(gridRes.y) || z >= int(gridRes.z))
+        return;
+    if (x != 0)
+        return;
+    
+    // Initialize velocity field with a jet flow condition.
+    float y0 = jetCenter.x - 0.5f;
+    float z0 = jetCenter.y - 0.5f;
+    
+    float normSquR = pow(y - y0, 2) / pow(R.x, 2) + pow(z - z0, 2) / pow(R.y, 2);
+    if (normSquR <= 1)
+    {
+        float U = Umax * (1 - normSquR);
+        velField[int3(0, y, z)] = float4(U, 0.0f, 0.0f, 0.0f);
+        velFieldLastTime[int3(0, y, z)] = float4(U, 0.0f, 0.0f, 0.0f);
+        velFieldLastIter[int3(0, y, z)] = float4(U, 0.0f, 0.0f, 0.0f);
+        flagField[id] = CELL_FLUID;
+    }
+}
+
+[numthreads(8, 8, 8)]
+void CSInitLidDrivenCavityFlowBndCond(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (x >= int(gridRes.x) || y >= int(gridRes.y) || z >= int(gridRes.z))
+        return;
+    if (z != gridRes.z - 1 || x == 0 || x == gridRes.x - 1 || y == 0 || y == gridRes.y - 1)
+        return;
+    
+    velField[int3(x, y, z)] = float4(Umax, 0.0f, 0.0f, 0.0f);
+    velFieldLastTime[int3(x, y, z)] = float4(Umax, 0.0f, 0.0f, 0.0f);
+    velFieldLastIter[int3(x, y, z)] = float4(Umax, 0.0f, 0.0f, 0.0f);
+    
+    flagField[int3(x, y, z)] = CELL_FLUID;
+}

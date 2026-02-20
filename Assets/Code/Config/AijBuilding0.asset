@@ -1,0 +1,118 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 91b4ae8ce0447c74e83db2ff9bad71a7, type: 3}
+  m_Name: AijBuilding0
+  m_EditorClassIdentifier: 
+  mode: 0
+  physDomainSize:
+    x: 80
+    y: 40
+    z: 40
+  gridResX: 80
+  dt: 0.04
+  mu: 0.000015
+  den: 1
+  Umax: 10
+  R:
+    x: 10
+    y: 10
+  jetCenter:
+    x: 25
+    y: 50
+  externalForce:
+    x: 0
+    y: 0
+    z: 0
+  velBndCondX0: 0
+  velBndCondXn: 1
+  velBndCondY0: 0
+  velBndCondYn: 2
+  velBndCondZ0: 2
+  velBndCondZn: 2
+  presBndCondX0: 1
+  presBndCondXn: 0
+  presBndCondY0: 1
+  presBndCondYn: 2
+  presBndCondZ0: 2
+  presBndCondZn: 2
+  velX0:
+    x: 10
+    y: 0
+    z: 0
+  velZn:
+    x: 0
+    y: 0
+    z: 0
+  solidType: 1
+  convectionScheme: 0
+  faceVelInterpScheme: 0
+  fvmSolverType: 0
+  PISONumCorrectors: 2
+  turbulenceModel: 1
+  smagorinskyConstant: 0.18
+  inflowType: 1
+  gridType: 0
+  calResidual: 1
+  velResidualCheckInterval: 50
+  velTolerance: 0.00001
+  velMaxNumIter: 100
+  presResidualCheckInterval: 50
+  presTolerance: 0.00001
+  presMaxNumIter: 1000
+  visualizeMode: 1
+  colorMap: 0
+  showVelocityField: 1
+  showPressureField: 0
+  showFlagField: 0
+  showVfx: 1
+  vFxArrowLengthFollowVelMag: 1
+  ySlice: 20
+  minVel: 0
+  maxVel: 20
+  minPres: -50
+  maxPres: 50
+  cameraHeight: 100
+  cameraAngle: 60
+  showSimulationTime: 1
+  showDomainBoundary: 1
+  visScale: 1
+  visInterpolateType: 0
+  boxStart:
+    x: 0.25
+    y: 0
+    z: 0.45
+  boxEnd:
+    x: 0.3
+    y: 0.2
+    z: 0.55
+  voxelizerType: 0
+  attachFieldToModelBottom: 0
+  simulateGround: 0
+  physFieldPos:
+    x: 0
+    y: 20
+    z: 0
+  showVoxelization: 0
+  slicePosSliderPos: {x: -50, y: 0}
+  slicePosSliderSize: {x: 20, y: 300}
+  timeSliderPos: {x: 0, y: 50}
+  timeSliderSize: {x: 300, y: 20}
+  saveVelField: 0
+  savePresField: 0
+  useAbsSaveDir: 0
+  absSaveDir: D:/Projects/Unity/UnityProjects/TestWindNoiseSimulation/Data
+  saveBeginStep: 100
+  saveInterval: 50
+  flagFileName: BuildingGroupFloor
+  useAbsReadDir: 0
+  absReadDir: D:/Projects/Unity/UnityProjects/TestWindNoiseSimulation/Data
+  readFileName: Field_20251125_181013.nc

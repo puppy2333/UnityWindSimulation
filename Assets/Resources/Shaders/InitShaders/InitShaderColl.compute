@@ -1,0 +1,387 @@
+#include "../Includes/Constants.hlsl"
+
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSInitFlagField
+#pragma kernel CSInitVelPresFields
+#pragma kernel CSInitLogVelPresFields
+#pragma kernel CSInitLogVelPresFieldsNonUniform
+#pragma kernel CSSetZeroVelBndCond
+#pragma kernel CSSetFixedValueVelBndCond
+#pragma kernel CSSetLogVelBndCond
+#pragma kernel CSSetLogVelBndCondNonUniform
+#pragma kernel CSInitBoxFlag
+#pragma kernel CSInitModelFlag
+#pragma kernel CSInitVelPresFieldsFromBGFlow
+#pragma kernel CSInitVelPresFieldsFromBGFlowRotate
+#pragma kernel CSFlagGpuToCpu
+#pragma kernel CSInitFaceEddyVisField
+
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWTexture3D<float4> velField;
+RWTexture3D<float4> velFieldLastTime;
+RWTexture3D<float4> velFieldLastIter;
+RWTexture3D<float4> velCorrectField;
+
+RWTexture3D<float> presFieldLastTime;
+RWTexture3D<float> presCorrectField;
+RWTexture3D<float> presCorrectFieldLastIter;
+
+RWTexture3D<int> flagField; // 0 for fluid, 1 for solid
+RWStructuredBuffer<int> flagFieldBuffer;
+
+RWTexture2D<float4> bndFieldX0;
+RWTexture2D<float4> bndFieldXn;
+RWTexture2D<float4> bndFieldY0;
+RWTexture2D<float4> bndFieldYn;
+RWTexture2D<float4> bndFieldZ0;
+RWTexture2D<float4> bndFieldZn;
+
+// ----- Background flow for forground flow re-init -----
+Texture3D<float4> velFieldBG;
+Texture3D<float> presFieldBG;
+SamplerState sampler_linear_clamp; // The name must include "linear" and "clamp" to contain corresponding functions
+
+// ----- Grid face position buffers (read only) -----
+StructuredBuffer<float> facePosX;
+StructuredBuffer<float> facePosY;
+StructuredBuffer<float> facePosZ;
+
+// ----- LES wall function initialization -----
+RWTexture3D<float4> faceEddyVisField;
+
+int3 gridRes;
+int2 R;
+int2 jetCenter;
+
+// Currently, only these two fixed-value velocity boundary conditions are implemented. velX0 is 
+// for inlet, velYn is for lid-driven cavity flow.
+float3 velX0;
+float3 velZn;
+
+float3 boxStart;
+float3 boxEnd;
+
+float3 internalVelField;
+
+// ----- For interpolation from background flow -----
+float dxFG;
+float dxBG;
+float3 physFieldPosFG;
+float3 physFieldPosBG;
+float fieldRotAng;
+int3 gridResBG;
+
+// ----- For log inflow velocity profile -----
+float dx;
+float karmanConst;
+float roughParam;
+float refHeight;
+
+
+[numthreads(8, 8, 8)]
+void CSInitFlagField(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (x < gridRes.x && y < gridRes.y && z < gridRes.z)
+    {
+        flagField[id] = CELL_FLUID;
+    }
+}
+
+[numthreads(8, 8, 8)]
+void CSInitVelPresFields(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (x >= int(gridRes.x) || y >= int(gridRes.y) || z >= int(gridRes.z))
+        return;
+    
+    velField[id] = float4(internalVelField.x, internalVelField.y, internalVelField.z, 0);
+    velFieldLastTime[id] = float4(internalVelField.x, internalVelField.y, internalVelField.z, 0);
+    velFieldLastIter[id] = float4(internalVelField.x, internalVelField.y, internalVelField.z, 0);
+    velCorrectField[id] = float4(0, 0, 0, 0);
+    
+    presFieldLastTime[id] = 0.0f;
+    presCorrectField[id] = 0.0f;
+    presCorrectFieldLastIter[id] = 0.0f;
+}
+
+[numthreads(8, 8, 8)]
+void CSInitLogVelPresFields(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (x >= int(gridRes.x) || y >= int(gridRes.y) || z >= int(gridRes.z))
+        return;
+    
+    float yPhys = y * dx;
+    float fricVel = karmanConst * internalVelField.x / log((refHeight + roughParam) / roughParam);
+    float vel = fricVel / karmanConst * log((yPhys + roughParam) / roughParam);
+    
+    velField[id] = float4(vel, 0, 0, 0);
+    velFieldLastTime[id] = float4(vel, 0, 0, 0);
+    velFieldLastIter[id] = float4(vel, 0, 0, 0);
+    velCorrectField[id] = float4(0, 0, 0, 0);
+    
+    presFieldLastTime[id] = 0.0f;
+    presCorrectField[id] = 0.0f;
+    presCorrectFieldLastIter[id] = 0.0f;
+}
+
+[numthreads(8, 8, 8)]
+void CSInitLogVelPresFieldsNonUniform(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (x >= gridRes.x || y >= gridRes.y || z >= gridRes.z)
+        return;
+    
+    float yPhys = 0.5 * (facePosY[y] + facePosY[y + 1]);
+    float fricVel = karmanConst * internalVelField.x / log((refHeight + roughParam) / roughParam);
+    float vel = fricVel / karmanConst * log((yPhys + roughParam) / roughParam);
+    
+    velField[id] = float4(vel, 0, 0, 0);
+    velFieldLastTime[id] = float4(vel, 0, 0, 0);
+    velFieldLastIter[id] = float4(vel, 0, 0, 0);
+    velCorrectField[id] = float4(0, 0, 0, 0);
+    
+    presFieldLastTime[id] = 0.0f;
+    presCorrectField[id] = 0.0f;
+    presCorrectFieldLastIter[id] = 0.0f;
+}
+
+[numthreads(8, 8, 8)]
+void CSInitVelPresFieldsFromBGFlow(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (x >= int(gridRes.x) || y >= int(gridRes.y) || z >= int(gridRes.z))
+        return;
+    
+    int3 idInt = (int3) id;
+    
+    // ----- Physical position of current foreground flow cell -----
+    float3 physPos = physFieldPosFG + idInt * dxFG - (gridRes / 2) * dxFG;
+    // ----- Corresponding uvw coordinate in background flow field -----
+    float3 uvwBG = (physPos - (physFieldPosBG - (gridResBG / 2) * dxBG)) / (gridResBG * dxBG);
+    
+    float3 velBG = velFieldBG.SampleLevel(sampler_linear_clamp, uvwBG, 0).xyz;
+    float presBG = presFieldBG.SampleLevel(sampler_linear_clamp, uvwBG, 0);
+    
+    velField[id] = float4(velBG.x, velBG.y, velBG.z, 0);
+    velFieldLastTime[id] = float4(velBG.x, velBG.y, velBG.z, 0);
+    velFieldLastIter[id] = float4(velBG.x, velBG.y, velBG.z, 0);
+    velCorrectField[id] = float4(0, 0, 0, 0);
+    
+    presFieldLastTime[id] = presBG;
+    presCorrectField[id] = 0.0f;
+    presCorrectFieldLastIter[id] = 0.0f;
+}
+
+[numthreads(8, 8, 8)]
+void CSInitVelPresFieldsFromBGFlowRotate(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (x >= int(gridRes.x) || y >= int(gridRes.y) || z >= int(gridRes.z))
+        return;
+    
+    int3 idInt = (int3) id;
+    
+    // ----- Physical position of current foreground flow cell -----
+    float s, c;
+    sincos(fieldRotAng, s, c);
+    float3 locPos = (idInt - gridRes / 2) * dxFG;
+    float3 relPos = float3(
+        locPos.x * c + locPos.z * s,
+        locPos.y,
+        locPos.z * c - locPos.x * s
+    );
+    float3 gloPos = physFieldPosFG + relPos;
+    
+    // ----- Corresponding uvw coordinate in background flow field -----
+    sincos(-fieldRotAng, s, c);
+    float3 relPosBG = gloPos - physFieldPosBG;
+    float3 locPosBG = float3(
+        relPosBG.x * c + relPosBG.z * s,
+        relPosBG.y,
+        relPosBG.z * c - relPosBG.x * s
+    );
+    float3 uvwBG = locPosBG / (gridResBG * dxBG) + 0.5;
+    
+    float3 velBG = velFieldBG.SampleLevel(sampler_linear_clamp, uvwBG, 0).xyz;
+    float presBG = presFieldBG.SampleLevel(sampler_linear_clamp, uvwBG, 0);
+    
+    velField[id] = float4(velBG.x, velBG.y, velBG.z, 0);
+    velFieldLastTime[id] = float4(velBG.x, velBG.y, velBG.z, 0);
+    velFieldLastIter[id] = float4(velBG.x, velBG.y, velBG.z, 0);
+    velCorrectField[id] = float4(0, 0, 0, 0);
+    
+    presFieldLastTime[id] = presBG;
+    presCorrectField[id] = 0.0f;
+    presCorrectFieldLastIter[id] = 0.0f;
+}
+
+[numthreads(8, 8, 8)]
+void CSSetZeroVelBndCond(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (x == 0 && y < gridRes.y && z < gridRes.z)
+    {
+        bndFieldX0[int2(y, z)] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        bndFieldXn[int2(y, z)] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    if (x < gridRes.x && y == 0 && z < gridRes.z)
+    {
+        bndFieldY0[int2(x, z)] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        bndFieldYn[int2(x, z)] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    if (x < gridRes.x && y < gridRes.y && z == 0)
+    {
+        bndFieldZ0[int2(x, y)] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        bndFieldZn[int2(x, y)] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+}
+
+// Currently, this kernel only implements bnd conds on x = 0 and y = Ny - 1. The other bnds will 
+// be added later.
+[numthreads(8, 8, 8)]
+void CSSetFixedValueVelBndCond(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (x == 0 && y < gridRes.y && z < gridRes.z)
+    {
+        bndFieldX0[int2(y, z)] = float4(velX0.x, velX0.y, velX0.z, 0.0f);
+    }
+    if (x < gridRes.x && y < gridRes.y && z == gridRes.z - 1)
+    {
+        bndFieldZn[int2(x, y)] = float4(velZn.x, velZn.y, velZn.z, 0.0f);
+    }
+}
+
+// Equation:
+// u* = k * u_ref / log((h_ref + h0) / h0)
+// u = u* / k * log((h + h0) / h0)
+// u*: friction velocity, k: Karman constant, u_ref: reference velocity at height h_ref, 
+// h0: roughness parameter, h: physical height of current cell center
+[numthreads(8, 8, 8)]
+void CSSetLogVelBndCond(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (x == 0 && y < gridRes.y && z < gridRes.z)
+    {
+        float yPhys = (y + 0.5) * dx;
+        float fricVel = karmanConst * velX0.x / log((refHeight + roughParam) / roughParam);
+        float vel = fricVel / karmanConst * log((yPhys + roughParam) / roughParam);
+        
+        bndFieldX0[int2(y, z)] = float4(vel, 0.0f, 0.0f, 0.0f);
+    }
+}
+
+[numthreads(8, 8, 8)]
+void CSSetLogVelBndCondNonUniform(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (x == 0 && y < gridRes.y && z < gridRes.z)
+    {
+        float yPhys = 0.5 * (facePosY[y] + facePosY[y + 1]);
+        float fricVel = karmanConst * velX0.x / log((refHeight + roughParam) / roughParam);
+        float vel = fricVel / karmanConst * log((yPhys + roughParam) / roughParam);
+        
+        bndFieldX0[int2(y, z)] = float4(vel, 0.0f, 0.0f, 0.0f);
+    }
+}
+
+[numthreads(8, 8, 8)]
+void CSInitBoxFlag(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (x >= gridRes.x || y >= gridRes.y || z >= gridRes.z)
+        return;
+    
+    //if (x >= boxStart.x * gridRes.x && x < boxEnd.x * gridRes.x &&
+    //    y >= boxStart.y * gridRes.y && y < boxEnd.y * gridRes.y &&
+    //    z >= boxStart.z * gridRes.z && z < boxEnd.z * gridRes.z)
+    //{
+    //    flagField[id] = CELL_SOLID;
+    //    velField[id] = float4(0, 0, 0, 0);
+    //    velFieldLastIter[id] = float4(0, 0, 0, 0);
+    //    velFieldLastTime[id] = float4(0, 0, 0, 0);
+    //}
+    
+    if (x >= 20 && x < 24 && y >= 0 && y < 8 && z >= 18 && z < 22)
+    {
+        flagField[id] = CELL_SOLID;
+        velField[id] = float4(0, 0, 0, 0);
+        velFieldLastIter[id] = float4(0, 0, 0, 0);
+        velFieldLastTime[id] = float4(0, 0, 0, 0);
+    }
+    
+    //if (x >= 40 && x < 48 && y >= 0 && y < 16 && z >= 36 && z < 44)
+    //{
+    //    flagField[id] = CELL_SOLID;
+    //    velField[id] = float4(0, 0, 0, 0);
+    //    velFieldLastIter[id] = float4(0, 0, 0, 0);
+    //    velFieldLastTime[id] = float4(0, 0, 0, 0);
+    //}
+    
+    //if (y == 0)
+    //{
+    //    flagField[id] = CELL_SOLID;
+    //    velField[id] = float4(0, 0, 0, 0);
+    //    velFieldLastIter[id] = float4(0, 0, 0, 0);
+    //    velFieldLastTime[id] = float4(0, 0, 0, 0);
+    //}
+}
+
+[numthreads(8, 8, 8)]
+void CSInitModelFlag(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (x >= gridRes.x || y >= gridRes.y || z >= gridRes.z)
+        return;
+    
+    if (flagFieldBuffer[z * (gridRes.x * gridRes.y) + y * gridRes.x + x] > 0.5)
+    {
+        flagField[id] = CELL_SOLID;
+        velField[id] = float4(0, 0, 0, 0);
+        velFieldLastIter[id] = float4(0, 0, 0, 0);
+        velFieldLastTime[id] = float4(0, 0, 0, 0);
+    }
+    else
+    {
+        flagField[id] = CELL_FLUID;
+    }
+}
+
+[numthreads(8, 8, 8)]
+void CSFlagGpuToCpu(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (x >= gridRes.x || y >= gridRes.y || z >= gridRes.z)
+        return;
+    
+    int idx = z * (gridRes.x * gridRes.y) + y * gridRes.x + x;
+    flagFieldBuffer[idx] = flagField[id];
+}
+
+[numthreads(8, 8, 8)]
+void CSInitFaceEddyVisField(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (x >= gridRes.x + 1 || y >= gridRes.y + 1 || z >= gridRes.z + 1)
+        return;
+    
+    faceEddyVisField[id] = float4(0.001f, 0.001f, 0.001f, 0.001f);
+}

@@ -1,0 +1,190 @@
+#include "../Includes/Constants.hlsl"
+
+// ----- Kernel declaration -----
+#pragma kernel CSCalLogLawWallFunc
+
+Texture3D<float4> velFieldLastTime;
+Texture3D<int> flagField; // 0 for fluid, 1 for solid
+RWTexture3D<float4> faceEddyVisField; // Les wall function
+
+// ----- Boundary condition textures -----
+// float4: (velX, velY, velZ, unused)
+Texture2D<float4> bndFieldX0;
+Texture2D<float4> bndFieldXn;
+Texture2D<float4> bndFieldY0;
+Texture2D<float4> bndFieldYn;
+Texture2D<float4> bndFieldZ0;
+Texture2D<float4> bndFieldZn;
+
+int3 gridRes;
+float dx;
+float ds;
+float nu;
+float den;
+
+float cs; // Smagorinsky constant
+
+int numBndFaces;
+
+// ----- Boundary types -----
+int velBndTypeX0;
+int velBndTypeXn;
+int velBndTypeY0;
+int velBndTypeYn;
+int velBndTypeZ0;
+int velBndTypeZn;
+
+int presBndTypeX0;
+int presBndTypeXn;
+int presBndTypeY0;
+int presBndTypeYn;
+int presBndTypeZ0;
+int presBndTypeZn;
+
+
+// ----- Return whether the cell with "id" is inside the simulation region -----
+bool InRegion(int3 id)
+{
+    return (id.x >= 0 && id.x < gridRes.x) && (id.y >= 0 && id.y < gridRes.y) && (id.z >= 0 && id.z < gridRes.z);
+}
+
+bool IsFluid(int3 id)
+{
+    return flagField[id] == CELL_FLUID;
+}
+
+bool IsSolid(int3 id)
+{
+    return flagField[id] == CELL_SOLID;
+}
+
+bool InRegionAndIsFluid(int3 id)
+{
+    if (InRegion(id))
+        return flagField[id] == CELL_FLUID;
+    else
+        return false;
+}
+
+bool InRegionAndIsSolid(int3 id)
+{
+    if (InRegion(id))
+        return flagField[id] == CELL_SOLID;
+    else
+        return false;
+}
+
+float LogLawWallFunc(float uP)
+{
+    float EConst = 9.8f;
+    float k = 0.41f;
+    float C = EConst * (dx / 2.0) / nu;
+    
+    float eddyVis = 0;
+    
+    float uTau = 1.0f; // Initial guess.
+    
+    // The input should be magnitude, not the value
+    uP = abs(uP);
+    
+    if (uP < 1e-5f) // If the velocity is too small, then the eddy viscosity is close to zero.
+    {
+        uTau = 0.0f;
+    }
+    else
+    {
+        for (int i = 0; i < 10; i++)
+        {   
+            float f = uTau * log(C * uTau) - k * uP;
+            float df = log(C * uTau) + 1.0f;
+        
+            if (abs(df) < 1e-6f)
+                break;
+            
+            uTau = uTau - f / df;
+            
+            // By definition, uTau should be positive.
+            if (uTau < 1e-5f)
+                uTau = 1e-5f;
+        }
+        
+        float tauWall = uTau * uTau * den;
+
+        float strainRate = uP / (dx / 2.0);
+
+        // This is a temp solution, it should minus nu.
+        eddyVis = tauWall / (strainRate * den) - nu;
+    
+        if (eddyVis < 0)
+            eddyVis = 0;
+    }
+    
+    return eddyVis;
+}
+
+// Each thread calculates the boundary viscosity at its west, south and down faces, so there is no 
+// race condition.
+[numthreads(8, 8, 8)]
+void CSCalLogLawWallFunc(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (!InRegion(id))
+        return;
+    
+    int3 P = int3(x, y, z);
+    int3 E = int3(x + 1, y, z);
+    int3 W = int3(x - 1, y, z);
+    int3 N = int3(x, y + 1, z);
+    int3 S = int3(x, y - 1, z);
+    int3 U = int3(x, y, z + 1);
+    int3 D = int3(x, y, z - 1);
+    
+    float3 faceEddyVis = float3(0, 0, 0);
+    
+    if (IsFluid(P))
+    {
+        // Don't check this boundary, since inlet boundary condition is also a fixed value.
+        if (InRegionAndIsSolid(W))
+        {
+            float uP = sqrt(pow(velFieldLastTime[P].y, 2) + pow(velFieldLastTime[P].z, 2));
+            float eddyVis = LogLawWallFunc(uP);
+            faceEddyVis += float3(eddyVis, 0, 0);
+        }
+        if (InRegionAndIsSolid(S) || (!InRegion(S) && velBndTypeY0 == VEL_BND_FIXED_VALUE))
+        {
+            float uP = sqrt(pow(velFieldLastTime[P].x, 2) + pow(velFieldLastTime[P].z, 2));
+            float eddyVis = LogLawWallFunc(uP);
+            faceEddyVis += float3(0, eddyVis, 0);
+        }
+        if (InRegionAndIsSolid(D))
+        {
+            float uP = sqrt(pow(velFieldLastTime[P].x, 2) + pow(velFieldLastTime[P].y, 2));
+            float eddyVis = LogLawWallFunc(uP);
+            faceEddyVis += float3(0, 0, eddyVis);
+        }
+    }
+    else if (IsSolid(P))
+    {
+        if (InRegionAndIsFluid(W))
+        {
+            float uP = sqrt(pow(velFieldLastTime[W].y, 2) + pow(velFieldLastTime[W].z, 2));
+            float eddyVis = LogLawWallFunc(uP);
+            faceEddyVis += float3(eddyVis, 0, 0);
+        }
+        if (InRegionAndIsFluid(S))
+        {
+            float uP = sqrt(pow(velFieldLastTime[S].x, 2) + pow(velFieldLastTime[S].z, 2));
+            float eddyVis = LogLawWallFunc(uP);
+            faceEddyVis += float3(0, eddyVis, 0);
+        }
+        if (InRegionAndIsFluid(D))
+        {
+            float uP = sqrt(pow(velFieldLastTime[D].x, 2) + pow(velFieldLastTime[D].y, 2));
+            float eddyVis = LogLawWallFunc(uP);
+            faceEddyVis += float3(0, 0, eddyVis);
+        }
+    }
+    
+    faceEddyVisField[P] = float4(faceEddyVis, 0);
+}

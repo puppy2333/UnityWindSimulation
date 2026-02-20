@@ -1,0 +1,40 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSCopyVelField
+#pragma kernel CSSetPresField
+
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWTexture3D<float4> destVel;
+RWTexture3D<float4> srcVel;
+
+RWTexture3D<float> destPres;
+RWTexture3D<float> srcPres;
+
+float presValue;
+
+int3 gridRes;
+int3 velRes;
+int3 presRes;
+
+[numthreads(8,8,8)]
+void CSCopyVelField (uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (x >= velRes.x || y >= velRes.y || z >= velRes.z)
+        return;
+    
+    destVel[id] = srcVel[id];
+}
+
+[numthreads(8, 8, 8)]
+void CSSetPresField(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (x >= presRes.x || y >= presRes.y || z >= presRes.z)
+        return;
+    
+    destPres[id] = presValue;
+}

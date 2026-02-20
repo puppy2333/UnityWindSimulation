@@ -1,0 +1,172 @@
+#include "../Includes/Constants.hlsl"
+
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSInitFlagField
+#pragma kernel CSInitBoxFlag
+#pragma kernel CSInitModelFlag
+#pragma kernel CSInitPresField
+#pragma kernel CSInitVelField
+#pragma kernel CSInitJetFlowBndCond
+#pragma kernel CSInitLidDrivenCavityFlowBndCond
+
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWTexture3D<float4> velField;
+RWTexture3D<float4> velFieldLastTime;
+RWTexture3D<float4> velFieldLastIter;
+
+RWTexture3D<float> presFieldLastTime;
+RWTexture3D<float> presCorrectField;
+RWTexture3D<float> presCorrectFieldLastIter;
+
+RWTexture3D<int> flagField; // 0 for fluid, 1 for solid
+RWStructuredBuffer<int> flagFieldBuffer;
+
+int3 gridRes;
+int3 velRes;
+int3 presRes;
+
+float Umax;
+int2 R;
+int2 jetCenter;
+
+float dirichletVelX;
+
+
+[numthreads(8, 8, 8)]
+void CSInitFlagField(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (x < presRes.x && y < presRes.y && z < presRes.z)
+    {
+        if (x == 0 || x == presRes.x - 1 || y == 0 || y == presRes.y - 1 || z == 0 || z == presRes.z - 1)
+        {
+            flagField[id] = CELL_BOUNDARY;
+        }
+        else
+        {
+            flagField[id] = CELL_FLUID;
+        }
+    }
+}
+
+[numthreads(8, 8, 8)]
+void CSInitBoxFlag(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (x >= presRes.x || y >= presRes.y || z >= presRes.z)
+        return;
+    
+    if (x > 0.25 * presRes.x && x < 0.5 * presRes.x &&
+        y > 0.375 * presRes.y && y < 0.625 * presRes.y - 1 &&
+        z > 0.375 * presRes.z && z < 0.625 * presRes.z - 1)
+    {
+        flagField[id] = CELL_SOLID;
+    }
+}
+
+[numthreads(8, 8, 8)]
+void CSInitModelFlag(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (x >= presRes.x || y >= presRes.y || z >= presRes.z)
+        return;
+    
+    if (flagFieldBuffer[z * (gridRes.x * gridRes.y) + y * gridRes.x + x] > 0.5)
+    {
+        flagField[id] = CELL_SOLID;
+    }
+}
+
+[numthreads(8, 8, 8)]
+void CSInitPresField(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (x < presRes.x && y < presRes.y && z < presRes.z)
+    {
+        presFieldLastTime[id] = 0.0f;
+        presCorrectField[id] = 0.0f;
+        presCorrectFieldLastIter[id] = 0.0f;
+    }
+}
+
+[numthreads(8, 8, 8)]
+void CSInitVelField(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    float3 vel = float3(dirichletVelX, 0.0f, 0.0f);
+    
+    if (x < velRes.x && y < velRes.y && z < velRes.z)
+    {
+        if (x > 0 && x < presRes.x - 1 && 
+            y > 0 && y < presRes.y - 1 &&
+            z > 0 && z < presRes.z - 1)
+        {
+            if (flagField[int3(x, y, z)] == CELL_SOLID || flagField[int3(x - 1, y, z)] == CELL_SOLID)
+            {
+                vel.x = 0.0f;
+            }
+        
+            if (flagField[int3(x, y, z)] == CELL_SOLID || flagField[int3(x, y - 1, z)] == CELL_SOLID)
+            {
+                vel.y = 0.0f;
+            }
+        
+            if (flagField[int3(x, y, z)] == CELL_SOLID || flagField[int3(x, y, z - 1)] == CELL_SOLID)
+            {
+                vel.z = 0.0f;
+            }
+        }
+        
+        velField[id] = float4(vel, 0);
+        velFieldLastTime[id] = float4(vel, 0);
+        velFieldLastIter[id] = float4(vel, 0);
+    }
+}
+
+[numthreads(8, 8, 8)]
+void CSInitJetFlowBndCond(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (x >= velRes.x || y >= velRes.y || z >= velRes.z)
+        return;
+    if (x != 0)
+        return;
+    
+    // Initialize velocity field with a jet flow condition.
+    float y0 = jetCenter.x - 0.5f;
+    float z0 = jetCenter.y - 0.5f;
+    
+    float normSquR = pow(y - y0, 2) / pow(R.x, 2) + pow(z - z0, 2) / pow(R.y, 2);
+    if (normSquR <= 1)
+    {
+        float U = Umax * (1 - normSquR);
+        velField[int3(0, y, z)] = float4(U, 0.0f, 0.0f, 0.0f);
+        velFieldLastTime[int3(0, y, z)] = float4(U, 0.0f, 0.0f, 0.0f);
+        velFieldLastIter[int3(0, y, z)] = float4(U, 0.0f, 0.0f, 0.0f);
+        flagField[int3(0, y, z)] = CELL_FLUID;
+
+    }
+}
+
+[numthreads(8, 8, 8)]
+void CSInitLidDrivenCavityFlowBndCond(uint3 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y, z = id.z;
+    
+    if (x > int(velRes.x) - 1 || y > int(velRes.y) || z > int(velRes.z) - 1)
+        return;
+    if (y != velRes.y - 1 || x == 0 || x == velRes.x - 1 || z == 0 || z == velRes.z - 1)
+        return;
+    
+    velField[int3(x, y, z)] = float4(Umax, 0.0f, 0.0f, 0.0f);
+    velFieldLastTime[int3(x, y, z)] = float4(Umax, 0.0f, 0.0f, 0.0f);
+    velFieldLastIter[int3(x, y, z)] = float4(Umax, 0.0f, 0.0f, 0.0f);
+}

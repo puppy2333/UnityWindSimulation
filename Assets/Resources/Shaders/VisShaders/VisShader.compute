@@ -1,0 +1,201 @@
+#include "../Includes/Constants.hlsl"
+
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSVisVel
+#pragma kernel CSVisVelDir
+#pragma kernel CSVisVelDefaultColormap
+#pragma kernel CSVisVelStag
+#pragma kernel CSVisPres
+#pragma kernel CSVisPresDefaultColormap
+#pragma kernel CSVisFlag
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWTexture3D<float4> velSim;
+RWTexture2D<float4> velVis;
+RWTexture2D<float> velVisDir;
+RWTexture3D<float> presSim;
+RWTexture2D<float4> presVis;
+RWTexture3D<int> flagSim;
+RWTexture2D<float4> flagVis;
+
+Texture2D<float4> colormapTex;
+
+int2 sliceRes;
+int ySlice;
+float minVel, maxVel;
+float minPres, maxPres;
+
+static const float4 kRedVec4 = float4(0.13572138f, 4.61539260f, -42.66032258f, 132.13108234f);
+static const float4 kGreenVec4 = float4(0.09140261f, 2.19418839f, 4.84296658f, -14.18503333f);
+static const float4 kBlueVec4 = float4(0.10667330f, 12.64194608f, -60.58204836f, 110.36276771f);
+static const float2 kRedVec2 = float2(-152.94239396f, 59.28637943f);
+static const float2 kGreenVec2 = float2(4.27729857f, 2.82956604f);
+static const float2 kBlueVec2 = float2(-89.90310912f, 27.34824973f);
+
+float InverseLerp(float a, float b, float value)
+{
+    return (value - a) / (b - a);
+}
+
+// Polynomial approximation for Turbo color map, found at here:
+// https://gist.github.com/mikhailov-work/0d177465a8151eb6ede1768d51d476c7
+// Which is referenced in the Google research blog:
+// https://research.google/blog/turbo-an-improved-rainbow-colormap-for-visualization/
+float3 TurboColorMap(float x)
+{    
+    float4 v4 = float4(1.0f, x, x * x, x * x * x);
+    float2 v2 = v4.zw * v4.z;
+    float3 result = float3(
+            dot(v4, kRedVec4) + dot(v2, kRedVec2),
+            dot(v4, kGreenVec4) + dot(v2, kGreenVec2),
+            dot(v4, kBlueVec4) + dot(v2, kBlueVec2)
+        );
+
+    return result;
+}
+
+float3 GammaToLinear(float3 color)
+{
+    return pow(color, 2.2);
+}
+
+// Turbo can be seen as a gamma-corrected color map. But gamma correction will be performed 
+// again when rendered on the screen, so it is first converted to linear space.
+float3 LinearTurboColorMap(float x)
+{
+    return GammaToLinear(TurboColorMap(x));
+}
+
+
+[numthreads(8, 8, 1)]
+void CSVisVel(uint2 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y;
+    
+    if (x >= sliceRes.x || y >= sliceRes.y)
+        return;
+    
+    float velMag = length(velSim[int3(id.x, ySlice, id.y)].xyz);
+    float t = InverseLerp(minVel, maxVel, velMag);
+    int index = clamp(int(t * 255.0f), 0, 255);
+    float4 linearColorVec = colormapTex[int2(index, 0)];
+    velVis[id] = float4(linearColorVec);
+}
+
+
+[numthreads(8, 8, 1)]
+void CSVisVelDir(uint2 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y;
+    
+    if (x >= sliceRes.x || y >= sliceRes.y)
+        return;
+    
+    float theta = 0;
+    
+    float ux = velSim[int3(id.x, ySlice, id.y)].x;
+    float uz = velSim[int3(id.x, ySlice, id.y)].z;
+    
+    // The negative sign is to compensate for a different coordinate system in Blender and Unity
+    if (ux > 0)
+    {
+        theta = - atan(uz / ux) * 180 / 3.1415926;
+    }
+    else if (ux < 0)
+    {
+        theta = 180 - atan(uz / ux) * 180 / 3.1415926;
+    }
+    
+    velVisDir[id] = theta;
+}
+
+
+[numthreads(8, 8, 1)]
+void CSVisVelDefaultColormap(uint2 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y;
+    
+    if (x >= sliceRes.x || y >= sliceRes.y)
+        return;
+    
+    float velMag = length(velSim[int3(id.x, ySlice, id.y)].xyz);
+    float t = InverseLerp(minVel, maxVel, velMag);
+    float3 linearColorVec = LinearTurboColorMap(t);
+    velVis[id] = float4(linearColorVec, 1.0f);
+}
+
+
+[numthreads(8, 8, 1)]
+void CSVisVelStag(uint2 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y;
+    
+    if (x >= sliceRes.x || y >= sliceRes.y)
+        return;
+    
+    float3 vel;
+    vel.x = 0.5 * (velSim[int3(id.x, ySlice, id.y)].x + velSim[int3(id.x + 1, ySlice, id.y)].x);
+    vel.y = 0.5 * (velSim[int3(id.x, ySlice, id.y)].y + velSim[int3(id.x, ySlice + 1, id.y)].y);
+    vel.z = 0.5 * (velSim[int3(id.x, ySlice, id.y)].z + velSim[int3(id.x, ySlice, id.y + 1)].z);
+    
+    float velMag = length(vel);
+    float t = InverseLerp(minVel, maxVel, velMag);
+    float3 linearColorVec = LinearTurboColorMap(t);
+    velVis[id] = float4(linearColorVec, 1.0f);
+}
+
+
+[numthreads(8, 8, 1)]
+void CSVisPres(uint2 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y;
+    
+    if (x >= sliceRes.x || y >= sliceRes.y)
+        return;
+    
+    float presMag = presSim[int3(id.x, ySlice, id.y)];
+    float t = InverseLerp(minPres, maxPres, presMag);
+    int index = clamp(int(t * 255.0f), 0, 255);
+    float4 colorVec = colormapTex[int2(index, 0)];
+    presVis[id] = float4(colorVec);
+}
+
+
+[numthreads(8, 8, 1)]
+void CSVisPresDefaultColormap(uint2 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y;
+    
+    if (x >= sliceRes.x || y >= sliceRes.y)
+        return;
+    
+    float presMag = presSim[int3(id.x, ySlice, id.y)];
+    float t = InverseLerp(minPres, maxPres, presMag);
+    float3 colorVec = LinearTurboColorMap(t);
+    presVis[id] = float4(colorVec, 0.0f);
+}
+
+
+[numthreads(8, 8, 1)]
+void CSVisFlag(uint2 id : SV_DispatchThreadID)
+{
+    int x = id.x, y = id.y;
+    
+    if (x >= sliceRes.x || y >= sliceRes.y)
+        return;
+    
+    float flagMag = (float)flagSim[int3(id.x, ySlice, id.y)];
+    
+    if (flagMag > CELL_SOLID - 0.1 && flagMag < CELL_SOLID + 0.1)
+    {
+        flagMag = CELL_SOLID;
+    }
+    else
+    {
+        flagMag = CELL_FLUID;
+    }
+        
+    
+    flagVis[id] = float4(flagMag, 0.0f, 0.0f, 0.0f);
+}

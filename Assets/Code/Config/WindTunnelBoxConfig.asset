@@ -1,0 +1,116 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 91b4ae8ce0447c74e83db2ff9bad71a7, type: 3}
+  m_Name: WindTunnelBoxConfig
+  m_EditorClassIdentifier: 
+  mode: 0
+  physDomainSize:
+    x: 100
+    y: 50
+    z: 100
+  gridResX: 100
+  dt: 0.02
+  mu: 1
+  den: 1
+  Umax: 10
+  R:
+    x: 10
+    y: 10
+  jetCenter:
+    x: 25
+    y: 50
+  externalForce:
+    x: 0
+    y: 0
+    z: 0
+  velBndCondX0: 0
+  velBndCondXn: 1
+  velBndCondY0: 2
+  velBndCondYn: 2
+  velBndCondZ0: 2
+  velBndCondZn: 2
+  presBndCondX0: 1
+  presBndCondXn: 0
+  presBndCondY0: 2
+  presBndCondYn: 2
+  presBndCondZ0: 2
+  presBndCondZn: 2
+  velX0:
+    x: 10
+    y: 0
+    z: 0
+  velZn:
+    x: 0
+    y: 0
+    z: 0
+  solidType: 1
+  convectionScheme: 0
+  faceVelInterpScheme: 0
+  fvmSolverType: 0
+  PISONumCorrectors: 2
+  turbulenceModel: 0
+  inflowType: 0
+  gridType: 1
+  calResidual: 0
+  velResidualCheckInterval: 50
+  velTolerance: 1e-15
+  velMaxNumIter: 800
+  presResidualCheckInterval: 100
+  presTolerance: 0.0001
+  presMaxNumIter: 2000
+  colorMap: 0
+  showVelocityField: 1
+  showPressureField: 1
+  showFlagField: 1
+  showVfx: 0
+  vFxArrowLengthFollowVelMag: 1
+  ySlice: 40
+  minVel: 0
+  maxVel: 20
+  minPres: -100
+  maxPres: 100
+  cameraHeight: 100
+  cameraAngle: 60
+  showSimulationTime: 1
+  showDomainBoundary: 0
+  visScale: 1
+  visInterpolateType: 0
+  boxStart:
+    x: 0.4
+    y: 0.4
+    z: 0.4
+  boxEnd:
+    x: 0.6
+    y: 0.6
+    z: 0.6
+  voxelizerType: 1
+  attachFieldToModelBottom: 0
+  simulateGround: 0
+  physFieldPos:
+    x: 0
+    y: 0
+    z: 0
+  showVoxelization: 0
+  slicePosSliderPos: {x: -350, y: 0}
+  slicePosSliderSize: {x: 20, y: 300}
+  timeSliderPos: {x: 0, y: 300}
+  timeSliderSize: {x: 300, y: 20}
+  saveVelField: 0
+  savePresField: 0
+  useAbsSaveDir: 0
+  absSaveDir: D:/Projects/Unity/UnityProjects/TestWindNoiseSimulation/Data
+  saveBeginStep: 1000
+  saveInterval: 3200
+  flagFileName: 
+  useAbsReadDir: 0
+  absReadDir: D:/Projects/Unity/UnityProjects/TestWindNoiseSimulation/Data
+  readFileName: Field_20251030_211758_SimpleBox_Re100.nc
