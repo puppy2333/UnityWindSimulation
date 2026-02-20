@@ -674,12 +674,33 @@ public class FvmSolverController : MonoBehaviour
         if (! simulateBackGroundFlow)
         {
             solver.InitVelPresFields();
+            visualizer.UpdateQuadPosByConfig();
         }
         else
         {
-            solver.InitVelPresFieldsFromBackGroundFlow(bgcf, velTexBackGround, presTexBackGround);
+            // Check if the new foreground field is still in the background field. If yes, re-init
+            // the foreground fields by interpolating from the background field; if not, re-init
+            // from scratch, also move the background field to the new foreground position, and
+            // re-init the background field.
+            if (cf.physFieldPos.x - cf.physDomainSize.x / 2 >= bgcf.physFieldPos.x - bgcf.physDomainSize.x / 2 && 
+                cf.physFieldPos.x + cf.physDomainSize.x / 2 <= bgcf.physFieldPos.x + bgcf.physDomainSize.x / 2 &&                 
+                cf.physFieldPos.z - cf.physDomainSize.z / 2 >= bgcf.physFieldPos.z - bgcf.physDomainSize.z / 2 && 
+                cf.physFieldPos.z + cf.physDomainSize.z / 2 <= bgcf.physFieldPos.z + bgcf.physDomainSize.z / 2)
+            {
+                solver.InitVelPresFieldsFromBackGroundFlow(bgcf, velTexBackGround, presTexBackGround);
+                visualizer.UpdateQuadPosByConfig();
+            }
+            else
+            {
+                solver.InitVelPresFields();
+                
+                bgcf.physFieldPos = cf.physFieldPos;
+                solverBackGround.InitVelPresFields();
+                
+                visualizer.UpdateQuadPosByConfig();
+                visualizerBackGround.UpdateQuadPosByConfig();
+            }
         }
-        visualizer.UpdateQuadPosByConfig();
 
         // ----- Re-init model and solver -----
         if (model != null && cf.solidType == SolidType.Model)

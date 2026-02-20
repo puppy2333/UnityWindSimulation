@@ -7127,7 +7127,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 0
+  m_IsActive: 1
 --- !u!114 &1092816842
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -10689,7 +10689,7 @@ RectTransform:
   m_Father: {fileID: 884301035}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
   m_AnchorMin: {x: 0, y: 0}
-  m_AnchorMax: {x: 0, y: 1}
+  m_AnchorMax: {x: 0, y: 0}
   m_AnchoredPosition: {x: 0, y: 0}
   m_SizeDelta: {x: 20, y: 0}
   m_Pivot: {x: 0.5, y: 0.5}
@@ -12043,8 +12043,8 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   simulationMode: 1
-  simulateBackGroundFlow: 0
-  cf: {fileID: 11400000, guid: 507b4b01299347b42abc3f9fb6c93870, type: 2}
+  simulateBackGroundFlow: 1
+  cf: {fileID: 11400000, guid: 3a43af757b106f14c9dc1e16b4338675, type: 2}
   bgcf: {fileID: 11400000, guid: 1666e1ca4e5b4254c9a0da9113be0b32, type: 2}
   model: {fileID: 20466023}
   colormapCsv: {fileID: 4900000, guid: cbb9fe79a91274245956854c7b11a0e3, type: 3}
@@ -13350,7 +13350,7 @@ RectTransform:
   m_Father: {fileID: 381092285}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
   m_AnchorMin: {x: 0, y: 0}
-  m_AnchorMax: {x: 0, y: 1}
+  m_AnchorMax: {x: 0, y: 0}
   m_AnchoredPosition: {x: 0, y: 0}
   m_SizeDelta: {x: 10, y: 0}
   m_Pivot: {x: 0.5, y: 0.5}
@@ -14749,7 +14749,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 0
+  m_IsActive: 1
 --- !u!114 &2144527434
 MonoBehaviour:
   m_ObjectHideFlags: 0
