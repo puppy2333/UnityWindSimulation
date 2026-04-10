@@ -15,7 +15,7 @@ SYSTEM REQUIREMENTS & TESTING ENVIRONMENT
 
 Tested Hardware:
 - CPU : Intel Core Ultra 9 185H
-- GPU : NVIDIA GeForce RTX 4070
+- GPU : NVIDIA GeForce RTX 4070 Laptop
 
 * Note: Because the core simulation relies heavily on Compute Shaders, a 
   discrete/dedicated GPU is strongly recommended for optimal performance.
@@ -44,7 +44,7 @@ USAGE INSTRUCTIONS
 RESULTS & VALIDATION
 --------------------
 1. Unity Settings   : The configuration file used to produce comparison 
-                      results is located in "Assets/Code/Config/AijBuilding0".
+                      results is located in "Assets/Code/Config/AijBuilding0NonUniform".
 2. OpenFOAM Settings: The corresponding OpenFOAM case setup, used as the 
                       baseline for validation and comparison, is provided in 
                       the dictionary "OpenFOAMSetting".
