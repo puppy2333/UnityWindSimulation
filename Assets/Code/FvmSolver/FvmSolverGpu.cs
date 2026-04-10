@@ -887,13 +887,13 @@ public class FvmSolverGpu : IFvmSolver
 
     public void InitVelPresFieldsFromBackGroundFlow(FluidSimConfig cfBG, RuntimeConfig rcfBG, RenderTexture velTexBG, RenderTexture presTexBG)
     {
-        if (cf.grid is UniformGrid)
+        if (cf.grid is UniformGrid or NonUniformGridDefault)
         {
             // ----- Set shader parameters (re-init interpolation) -----
             initShader.SetFloat("dxFG", rcf.dxUnif);
             initShader.SetFloat("dxBG", rcfBG.dxUnif);
-            initShader.SetFloats("physFieldPosFG", cf.physFieldPos.x, cf.physFieldPos.y, cf.physFieldPos.z);
-            initShader.SetFloats("physFieldPosBG", cfBG.physFieldPos.x, cfBG.physFieldPos.y, cfBG.physFieldPos.z);
+            initShader.SetFloats("physFieldPosFG", rcf.physFieldPos.x, rcf.physFieldPos.y, rcf.physFieldPos.z);
+            initShader.SetFloats("physFieldPosBG", rcfBG.physFieldPos.x, rcfBG.physFieldPos.y, rcfBG.physFieldPos.z);
             initShader.SetFloat("fieldRotAng", rcf.flowFieldOrientation * (float)(3.1415926 / 180));
             initShader.SetInts("gridResBG", rcfBG.numCells.x, rcfBG.numCells.y, rcfBG.numCells.z);
 

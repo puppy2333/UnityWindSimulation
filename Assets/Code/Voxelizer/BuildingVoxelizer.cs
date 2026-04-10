@@ -429,6 +429,9 @@ public class Voxelizer
             stopwatch.Start();
         }
 
+        insideBuildingsIdSet.Clear();
+        edgeBuildingsIdSet.Clear();
+
         int terrainMask = LayerMask.GetMask("CesiumTerrain");
 
         Quaternion q = Quaternion.Euler(0f, rcf.flowFieldOrientation, 0f);
