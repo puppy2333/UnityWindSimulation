@@ -44,7 +44,8 @@ USAGE INSTRUCTIONS
 RESULTS & VALIDATION
 --------------------
 1. Unity Settings   : The configuration file used to produce comparison 
-                      results is located in "Assets/Code/Config/AijBuilding0NonUniform".
+                      results is located in 
+                      "Assets/Code/Config/AijBuilding0NonUniform".
 2. OpenFOAM Settings: The corresponding OpenFOAM case setup, used as the 
                       baseline for validation and comparison, is provided in 
                       the dictionary "OpenFOAMSetting".
