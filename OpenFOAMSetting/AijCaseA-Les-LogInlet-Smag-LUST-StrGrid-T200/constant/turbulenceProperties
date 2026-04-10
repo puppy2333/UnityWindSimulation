@@ -2,7 +2,7 @@
 | =========                 |                                                 |
 | \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
 |  \\    /   O peration     | Version:  v2412                                 |
-|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|   \\  /    A nd           |                                                 |
 |    \\/     M anipulation  |                                                 |
 \*---------------------------------------------------------------------------*/
 FoamFile
@@ -10,49 +10,30 @@ FoamFile
     version     2.0;
     format      ascii;
     class       dictionary;
-    object      fvSchemes;
+    object      turbulenceProperties;
 }
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
-ddtSchemes
-{
-    default         Euler;
-}
+simulationType  LES;
 
-gradSchemes
+// I have confirmed that these are the only parameters needed for Smagroinsky model.
+LES
 {
-    default         Gauss linear;
-    grad(p)         cellLimited Gauss linear 1;
-}
+    model           Smagorinsky;
+    turbulence      on;
+    printCoeffs     on;
+    delta           cubeRootVol;
 
-divSchemes
-{
-    default                             none;
-    div(phi,U)                          Gauss LUST grad(U);
-    div((nuEff*dev2(T(grad(U)))))       Gauss linear;
-}
+    cubeRootVolCoeffs
+    {
+        deltaCoeff      1;
+    }
 
-laplacianSchemes
-{
-    default         Gauss linear orthogonal;
+    SmagorinskyCoeffs
+    {
+        Ck                  0.094;
+        Ce                  1.048;
+    }
 }
-
-interpolationSchemes
-{
-    default         linear;
-}
-
-snGradSchemes
-{
-    default         orthogonal;
-}
-
-// This parameter is found in a tutorial.
-wallDist
-{
-    method          exactDistance;
-    nRequired       yes;
-}
-
 
 // ************************************************************************* //

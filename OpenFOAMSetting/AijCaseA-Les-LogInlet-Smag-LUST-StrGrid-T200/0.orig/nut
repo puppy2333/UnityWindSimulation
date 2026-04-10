@@ -1,7 +1,7 @@
 /*--------------------------------*- C++ -*----------------------------------*\
 | =========                 |                                                 |
 | \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
-|  \\    /   O peration     | Version:  v2412                                 |
+|  \\    /   O peration     | Version:  2412                                  |
 |   \\  /    A nd           | Website:  www.openfoam.com                      |
 |    \\/     M anipulation  |                                                 |
 \*---------------------------------------------------------------------------*/
@@ -9,52 +9,48 @@ FoamFile
 {
     version     2.0;
     format      ascii;
-    class       dictionary;
-    object      changeDictionaryDict;
+    arch        "LSB;label=32;scalar=64";
+    class       volScalarField;
+    location    "0";
+    object      nut;
 }
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
-boundary
-{
-    solidBnd
-    {
-        type            wall;
-        inGroups        1 ( wall );
-    }
-}
+dimensions      [ 0 2 -1 0 0 0 0 ];
 
-U
-{
-    boundaryField
-    {
-        solidBnd
-        {
-            type            fixedValue;
-            value           uniform ( 0 0 0 );
-        }
-    }
-}
+internalField   uniform 0;
 
-p
+boundaryField
 {
-    boundaryField
+    inlet
     {
-        solidBnd
-        {
-            type            zeroGradient;
-        }
+        type            zeroGradient;
     }
-}
-
-nut
-{
-    boundaryField
+    outlet
     {
-        solidBnd
-        {
-            type            nutUWallFunction;
-            value           uniform 0;
-        }
+        type            zeroGradient;
+    }
+    ground
+    {
+        type            nutUWallFunction;
+        value           uniform 0;
+    }
+    building
+    {
+        type            nutUWallFunction;
+        value           uniform 0;
+    }
+    up
+    {
+        type            symmetryPlane;
+    }
+    front
+    {
+        type            symmetryPlane;
+    }
+    back
+    {
+        type            symmetryPlane;
     }
 }
 

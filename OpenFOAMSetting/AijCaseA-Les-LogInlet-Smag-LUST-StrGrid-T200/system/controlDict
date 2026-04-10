@@ -1,0 +1,122 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  v2412                                 |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      controlDict;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+application     pimpleFoam;
+
+startFrom       startTime;
+
+startTime       0;
+
+stopAt          endTime;
+
+endTime         200;
+
+deltaT          0.005; // Averaged CFL = 10 * 0.005 / 0.2 = 0.25
+
+writeControl    timeStep;
+
+writeInterval   10000; // Save per 50s
+
+purgeWrite      3; // Only keep three latest time steps
+
+writeFormat     ascii;
+
+writePrecision  6;
+
+writeCompression off;
+
+timeFormat      general;
+
+timePrecision   6;
+
+runTimeModifiable true;
+
+functions
+{
+    linesample
+    {
+        type            sets;
+        libs            ("libsampling.so");
+        writeControl    timeStep;
+        writeInterval   10; // 20 samples per second
+
+        interpolationScheme cellPoint;
+        setFormat       raw;
+
+        fields          (
+            U p
+        );
+
+        sets
+        {
+            sampleYAxis_x25_zCenter
+            {
+                type        uniform;
+                axis        y;
+                start       (25 0.25 20);
+                end         (25 39.75 20);
+                nPoints     80;
+            }
+
+            sampleYAxis_x30_zCenter
+            {
+                type        uniform;
+                axis        y;
+                start       (30 0.25 20);
+                end         (30 39.75 20);
+                nPoints     80;
+            }
+
+            sampleYAxis_x35_zCenter
+            {
+                type        uniform;
+                axis        y;
+                start       (35 0.25 20);
+                end         (35 39.75 20);
+                nPoints     80;
+            }
+
+            sampleZAxis_x25_y1
+            {
+                type        uniform;
+                axis        z;
+                start       (25 1.5 0.25);
+                end         (25 1.5 39.75);
+                nPoints     80;
+            }
+
+            sampleZAxis_x30_y1
+            {
+                type        uniform;
+                axis        z;
+                start       (30 1.5 0.25);
+                end         (30 1.5 39.75);
+                nPoints     80;
+            }
+
+            sampleZAxis_x35_y1
+            {
+                type        uniform;
+                axis        z;
+                start       (35 1.5 0.25);
+                end         (35 1.5 39.75);
+                nPoints     80;
+            }
+        }
+    }
+}
+
+// ************************************************************************* //

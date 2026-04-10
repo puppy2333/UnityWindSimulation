@@ -10,29 +10,50 @@ FoamFile
     version     2.0;
     format      ascii;
     class       dictionary;
-    object      topoSetDict;
+    object      fvSolution;
 }
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
-actions
-(
-    // Create a cellSet that contains all the solids (we use the name fluidCells, so in the next 
-    // step we can directly invert it).
+solvers
+{
+    p
     {
-        name    fluidCells;
-        type    cellSet;
-        action  new;
-        source  boxToCell;
-        sourceInfo
-        {
-            box     (20 0 18) (24 8 22);
-        }
+        solver          PCG;
+        preconditioner  DIC;
+        tolerance       1e-05;
+        relTol          0.05;
     }
 
-    // Invert the cells created in the last step.
+    pFinal
     {
-        name    fluidCells;
-        type    cellSet;
-        action  invert;
+        $p;
+        relTol          0;
     }
-);
+
+    U
+    {
+        solver          smoothSolver;
+        smoother        symGaussSeidel;
+        tolerance       1e-05;
+        relTol          0;
+    }
+
+    UFinal
+    {
+        $U;
+        tolerance       1e-05;
+        relTol          0;
+    }
+}
+
+PIMPLE
+{
+    nOuterCorrectors           1;
+    nCorrectors                1;
+    nNonOrthogonalCorrectors   0;
+    finalOnLastPimpleIterOnly  true;
+    turbOnFinalIterOnly        false;
+}
+
+
+// ************************************************************************* //

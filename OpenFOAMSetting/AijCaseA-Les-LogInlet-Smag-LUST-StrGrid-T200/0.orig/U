@@ -10,47 +10,50 @@ FoamFile
     version     2.0;
     format      ascii;
     arch        "LSB;label=32;scalar=64";
-    class       volScalarField;
+    class       volVectorField;
     location    "0";
-    object      nut;
+    object      U;
 }
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
-dimensions      [ 0 2 -1 0 0 0 0 ];
+dimensions      [ 0 1 -1 0 0 0 0 ];
 
-internalField   uniform 0;
+internalField   uniform ( 10 0 0 );
 
 boundaryField
 {
     inlet
     {
-        type            zeroGradient;
+        type            exprFixedValue;
+        value           uniform ( 10 0 0 );
+        valueExpr       #{vector(10.0 * log((pos().y() + 1.0) / 1.0) / log(11.0 / 1.0), 0, 0)#};
+        variables       ( );
     }
     outlet
     {
         type            zeroGradient;
     }
-    upSlipBnd
+    ground
+    {
+        type            fixedValue;
+        value           uniform ( 0 0 0 );
+    }
+    building
+    {
+        type            fixedValue;
+        value           uniform ( 0 0 0 );
+    }
+    up
     {
         type            symmetryPlane;
     }
-    downSolidBnd
-    {
-        type            nutUWallFunction;
-        value           uniform 0;
-    }
-    frontSlipBnd
+    front
     {
         type            symmetryPlane;
     }
-    backSlipBnd
+    back
     {
         type            symmetryPlane;
-    }
-    solidBnd
-    {
-        type            nutUWallFunction;
-        value           uniform 0;
     }
 }
 
