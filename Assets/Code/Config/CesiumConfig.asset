@@ -13,21 +13,11 @@ MonoBehaviour:
   m_Name: CesiumConfig
   m_EditorClassIdentifier: 
   mode: 0
-  physDomainSize:
-    x: 200
-    y: 40
-    z: 200
-  gridResX: 200
-  dt: 0.02
+  grid:
+    rid: 6560383611104919552
+  dt: 0.025
   mu: 0.000015
-  den: 1.2
-  Umax: 10
-  R:
-    x: 10
-    y: 10
-  jetCenter:
-    x: 25
-    y: 50
+  den: 1
   externalForce:
     x: 0
     y: 0
@@ -53,21 +43,21 @@ MonoBehaviour:
     y: 0
     z: 0
   solidType: 2
-  convectionScheme: 0
+  convectScheme: 2
   faceVelInterpScheme: 0
   fvmSolverType: 0
   PISONumCorrectors: 2
   turbulenceModel: 1
   smagorinskyConstant: 0.15
   inflowType: 1
-  gridType: 0
   calResidual: 1
-  velResidualCheckInterval: 40
-  velTolerance: 1e-15
-  velMaxNumIter: 100
-  presResidualCheckInterval: 40
-  presTolerance: 0.0001
-  presMaxNumIter: 1000
+  calMaxCfl: 1
+  velResidualCheckInterval: 50
+  velTolerance: 0.00001
+  velMaxNumIter: 400
+  presResidualCheckInterval: 50
+  presTolerance: 0.00001
+  presMaxNumIter: 2000
   visualizeMode: 1
   colorMap: 0
   showVelocityField: 1
@@ -77,7 +67,7 @@ MonoBehaviour:
   vFxArrowLengthFollowVelMag: 1
   ySlice: 25
   minVel: 0
-  maxVel: 20
+  maxVel: 25
   minPres: -500
   maxPres: 500
   cameraHeight: 100
@@ -86,20 +76,12 @@ MonoBehaviour:
   showDomainBoundary: 1
   visScale: 1
   visInterpolateType: 0
-  boxStart:
-    x: 0.4
-    y: 0.4
-    z: 0.4
-  boxEnd:
-    x: 0.6
-    y: 0.6
-    z: 0.6
   voxelizerType: 0
   attachFieldToModelBottom: 0
   simulateGround: 0
   physFieldPos:
     x: 0
-    y: 20
+    y: 0
     z: 0
   showVoxelization: 0
   slicePosSliderPos: {x: -50, y: 0}
@@ -108,11 +90,46 @@ MonoBehaviour:
   timeSliderSize: {x: 300, y: 20}
   saveVelField: 0
   savePresField: 0
+  saveSampleLine: 0
   useAbsSaveDir: 0
   absSaveDir: D:/Projects/Unity/UnityProjects/TestWindNoiseSimulation/Data
   saveBeginStep: 50
   saveInterval: 50
   flagFileName: BuildingGroupFloor
+  sampleLineSaveBeginStep: 0
+  sampleLineSaveInterval: 10
+  sampleLines: []
   useAbsReadDir: 0
   absReadDir: D:/Projects/Unity/UnityProjects/TestWindNoiseSimulation/Data
   readFileName: Field_20251125_181013.nc
+  references:
+    version: 2
+    RefIds:
+    - rid: 6560383611104919552
+      type: {class: NonUniformGridDefault, ns: , asm: Assembly-CSharp}
+      data:
+        userDefinedPhysDomainSize:
+          x: 300
+          y: 80
+          z: 160
+        unifRegionPhysStartOffset:
+          x: 0
+          y: 0
+          z: 0
+        unifRegionPhysDomainSize:
+          x: 300
+          y: 80
+          z: 160
+        unifRegionNumCellsX: 300
+        stretchFactor:
+          x: 1
+          y: 1
+          z: 1
+        userBoxStartPhysOffset:
+          x: 0
+          y: 0
+          z: 0
+        userBoxEndPhysOffset:
+          x: 0
+          y: 0
+          z: 0

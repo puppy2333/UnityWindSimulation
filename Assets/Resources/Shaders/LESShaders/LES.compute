@@ -72,35 +72,6 @@ bool InRegionAndIsSolid(int3 id)
         return false;
 }
 
-// This code has bug: when the neighbor cell is out of region, we should check the boundary type 
-// to determine the face velocity, instead of directly using the boundary velocity.
-float3 GetFaceVelLastTime(int3 id, int3 neighborId)
-{
-    float3 faceVel = 0;
-    
-    if (InRegionAndIsFluid(neighborId))
-        faceVel = 0.5 * (velFieldLastTime[id].xyz + velFieldLastTime[neighborId].xyz);
-    else if (!InRegion(neighborId))
-    {
-        if (neighborId.x < 0)
-            faceVel = bndFieldX0[int2(neighborId.y, neighborId.z)].xyz;
-        else if (neighborId.x >= gridRes.x)
-            faceVel = bndFieldXn[int2(neighborId.y, neighborId.z)].xyz;
-        else if (neighborId.y < 0)
-            faceVel = bndFieldY0[int2(neighborId.x, neighborId.z)].xyz;
-        else if (neighborId.y >= gridRes.y)
-            faceVel = bndFieldYn[int2(neighborId.x, neighborId.z)].xyz;
-        else if (neighborId.z < 0)
-            faceVel = bndFieldZ0[int2(neighborId.x, neighborId.y)].xyz;
-        else if (neighborId.z >= gridRes.z)
-            faceVel = bndFieldZn[int2(neighborId.x, neighborId.y)].xyz;
-    }
-    else
-        faceVel = 0;
-    
-    return faceVel;
-}
-
 float3 GetEFaceVelLastTime(int3 P)
 {
     int3 E = P + int3(1, 0, 0);

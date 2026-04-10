@@ -1,4 +1,4 @@
-Shader "Custom/VisShaderVel"
+Shader "Custom/VisShaderVelNonUnif"
 {
     SubShader
     {
@@ -36,6 +36,16 @@ Shader "Custom/VisShaderVel"
             TEXTURE2D(_ColorMapTex);
             SAMPLER(sampler_ColorMapTex);
 
+            // UV mapping textures in x and z directions
+            TEXTURE2D(_XMapTex);
+            SAMPLER(sampler_XMapTex);
+
+            TEXTURE2D(_YMapTex);
+            SAMPLER(sampler_YMapTex);
+
+            TEXTURE2D(_ZMapTex);
+            SAMPLER(sampler_ZMapTex);
+
             CBUFFER_START(UnityPerMaterial)
                 float _YSlice;
                 float _MinVel;
@@ -55,8 +65,14 @@ Shader "Custom/VisShaderVel"
             float4 frag(Varyings input) : SV_Target
             {
                 float3 uvw = float3(input.uv.x, _YSlice, input.uv.y);
+
+                float3 nonUnifUvw = float3(
+                    SAMPLE_TEXTURE2D(_XMapTex, sampler_XMapTex, float2(uvw.x, 0.5)).x,
+                    SAMPLE_TEXTURE2D(_YMapTex, sampler_YMapTex, float2(uvw.y, 0.5)).x,
+                    SAMPLE_TEXTURE2D(_ZMapTex, sampler_ZMapTex, float2(uvw.z, 0.5)).x
+                );
                 
-                float4 velVec = SAMPLE_TEXTURE3D(_VelSimTex, sampler_VelSimTex, uvw);
+                float4 velVec = SAMPLE_TEXTURE3D(_VelSimTex, sampler_VelSimTex, nonUnifUvw);
                 
                 float speed = length(velVec.xyz);
                 float normalizedSpeed = saturate((speed - _MinVel) / (_MaxVel - _MinVel));

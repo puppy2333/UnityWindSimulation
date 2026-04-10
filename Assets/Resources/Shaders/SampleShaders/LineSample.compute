@@ -1,0 +1,63 @@
+#pragma kernel CSSampleVelX
+
+
+// Vel field to be sampled
+Texture3D<float4> velField;
+// Sampled vel output texture
+RWTexture2D<float> sampleLinesTex;
+
+// Stores the bottom (x, y, z) 
+StructuredBuffer<int3> sampleIdsBuffer;
+// Stores the interpolation weights (wx, wy, wz)
+StructuredBuffer<float3> sampleWeightsBuffer;
+
+int3 gridRes;
+int numSampleLines;
+int maxNumSamples;
+
+float SampleVelX(int lineIdx, int sampleIdx)
+{
+    int sampleFlatIdx = lineIdx * maxNumSamples + sampleIdx;
+
+    int3 sampleBottomIds = sampleIdsBuffer[sampleFlatIdx].xyz;
+    float3 sampleWeights = sampleWeightsBuffer[sampleFlatIdx].xyz;
+
+    int idxX = sampleBottomIds.x;
+    int idxY = sampleBottomIds.y;
+    int idxZ = sampleBottomIds.z;
+
+    float wx = sampleWeights.x;
+    float wy = sampleWeights.y;
+    float wz = sampleWeights.z;
+
+    float u000 = velField[int3(idxX,     idxY,     idxZ    )].x;
+    float u100 = velField[int3(idxX + 1, idxY,     idxZ    )].x;
+    float u010 = velField[int3(idxX,     idxY + 1, idxZ    )].x;
+    float u110 = velField[int3(idxX + 1, idxY + 1, idxZ    )].x;
+    float u001 = velField[int3(idxX,     idxY,     idxZ + 1)].x;
+    float u101 = velField[int3(idxX + 1, idxY,     idxZ + 1)].x;
+    float u011 = velField[int3(idxX,     idxY + 1, idxZ + 1)].x;
+    float u111 = velField[int3(idxX + 1, idxY + 1, idxZ + 1)].x;
+
+    float u00 = lerp(u100, u000, wx);
+    float u10 = lerp(u110, u010, wx);
+    float u01 = lerp(u101, u001, wx);
+    float u11 = lerp(u111, u011, wx);
+
+    float u0 = lerp(u10, u00, wy);
+    float u1 = lerp(u11, u01, wy);
+
+    return lerp(u1, u0, wz);
+}
+
+[numthreads(8,8,1)]
+void CSSampleVelX (uint3 id : SV_DispatchThreadID)
+{
+    int lineIdx = id.x;
+    int sampleIdx = id.y;
+
+    if (lineIdx >= numSampleLines || sampleIdx >= maxNumSamples)
+        return;
+
+    sampleLinesTex[int2(lineIdx, sampleIdx)] = SampleVelX(lineIdx, sampleIdx);
+}

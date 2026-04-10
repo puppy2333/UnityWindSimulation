@@ -53,7 +53,7 @@ MonoBehaviour:
     y: 0
     z: 0
   solidType: 1
-  convectionScheme: 0
+  convectScheme: 2
   faceVelInterpScheme: 0
   fvmSolverType: 0
   PISONumCorrectors: 2
@@ -68,7 +68,7 @@ MonoBehaviour:
   presResidualCheckInterval: 50
   presTolerance: 0.00001
   presMaxNumIter: 1000
-  visualizeMode: 1
+  visualizeMode: 0
   colorMap: 0
   showVelocityField: 1
   showPressureField: 0
@@ -106,13 +106,13 @@ MonoBehaviour:
   slicePosSliderSize: {x: 20, y: 300}
   timeSliderPos: {x: 0, y: 50}
   timeSliderSize: {x: 300, y: 20}
-  saveVelField: 0
-  savePresField: 0
+  saveVelField: 1
+  savePresField: 1
   useAbsSaveDir: 0
   absSaveDir: D:/Projects/Unity/UnityProjects/TestWindNoiseSimulation/Data
-  saveBeginStep: 100
+  saveBeginStep: 7500
   saveInterval: 50
   flagFileName: BuildingGroupFloor
   useAbsReadDir: 0
   absReadDir: D:/Projects/Unity/UnityProjects/TestWindNoiseSimulation/Data
-  readFileName: Field_20251125_181013.nc
+  readFileName: Field_20260214_144751.nc

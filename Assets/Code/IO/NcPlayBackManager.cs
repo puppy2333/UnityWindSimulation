@@ -126,7 +126,7 @@ public class NcPlayBackManager
         // Open NetCDF file.
         Debug.Log("Opening NetCDF file: " + cf.readPath);
         status = CsNetCDF.NetCDF.nc_open(cf.readPath, CsNetCDF.NetCDF.OpenMode.NC_NOWRITE, out fileId);
-        CheckError("Creat NetCDF file error: ");
+        CheckError("Open NetCDF file error: ");
 
         // Read meta data.
         status = CsNetCDF.NetCDF.nc_inq_dimid(fileId, "time", out dimTimeId);
@@ -157,19 +157,6 @@ public class NcPlayBackManager
 
         StringBuilder gridLayoutType = new((int)gridLayoutTypeLength);
         status = CsNetCDF.NetCDF.nc_get_att_text(fileId, CsNetCDF.NetCDF.NC_GLOBAL, "gridLayoutType", gridLayoutType);
-
-        if (gridLayoutType.ToString() == GridType.Collocated.ToString())
-        {
-            cf.gridType = GridType.Collocated;
-        }
-        else if (gridLayoutType.ToString() == GridType.Staggered.ToString())
-        {
-            cf.gridType = GridType.Staggered;
-        }
-        else
-        {
-            Debug.LogError("Unknown grid layout type in the NetCDF file: " + gridLayoutType.ToString());
-        }
 
         // Allocate memory for playback data.
         timePlayBack = new float[numFrames];

@@ -23,6 +23,7 @@ public class FvmSolverController : MonoBehaviour
     public FluidSimConfig cf;
     public FluidSimConfig bgcf;
     private RuntimeConfig rcf;
+    private RuntimeConfig rbgcf;
 
     // CPU visualizer
     public IVisualizer visualizer;
@@ -33,6 +34,7 @@ public class FvmSolverController : MonoBehaviour
     public TextAsset colormapCsv;
 
     public VisualEffect targetVfx;
+    public VisualEffect particleSystemVfx;
     public VisualEffect flowDirArrow;
     Vector3 arrowPosition = Vector3.zero;
 
@@ -67,6 +69,13 @@ public class FvmSolverController : MonoBehaviour
 
     RenderTexture velTexBackGround, presTexBackGround, flagTexBackGround;
 
+    // ----- Grids -----
+    float[] facePosXArray;
+    float[] facePosYArray;
+    float[] facePosZArray;
+
+    float[] facePosXArrayBG, facePosYArrayBG, facePosZArrayBG;
+
     // Visualization slider.
     private VisualizerSlider slicePosSlider;
     private VisualizerSlider backGroundSlicePosSlider;
@@ -77,8 +86,15 @@ public class FvmSolverController : MonoBehaviour
 
     public NcPlayBackManager playBackManager;
 
+    private SampleLine lineSampler;
+    private NcSampleLineExporter sampleLineExporter;
+    private RenderTexture lineSampleTex;
+
     int updateCount = 0;
     int backGroundFlowUpdateInterval = 1;
+    bool physDomainSizeCalculated = false;
+    float3 physDomainSizeDisplayed = new(0, 0, 0);
+    float3 physDomainSizeDisplayedBG = new(0, 0, 0);
 
     // ----- UI canvas -----
     GameObject canvasObject;
@@ -94,6 +110,8 @@ public class FvmSolverController : MonoBehaviour
     public Button confirmOrientationButtion;
 
     public Button vfxStartStopButton;
+    public Button vfxStartStopButton2;
+    public Button vfxCleanParticlesButton;
 
     public Button knmiButton;
 
@@ -120,6 +138,7 @@ public class FvmSolverController : MonoBehaviour
     SimuStatus simuStatus = SimuStatus.Uninited;
     
     bool vfxStarted = false;
+    bool particleSystemVfxStarted = false;
 
     // ----- Knmi api loader -----
     private KNMILoader knmiLoader;
@@ -152,6 +171,11 @@ public class FvmSolverController : MonoBehaviour
 
         // ----- Initialize runtime config -----
         rcf = new RuntimeConfig(cf, new double3(cesiumGeoreference.longitude, cesiumGeoreference.latitude, cesiumGeoreference.height));
+        if (simulateBackGroundFlow)
+        {
+            rbgcf = new RuntimeConfig(bgcf, new double3(cesiumGeoreference.longitude, cesiumGeoreference.latitude, cesiumGeoreference.height));
+        }
+        
 
         // ----- Initialize canvas for sliders (legacy) -----
         initCanvas();
@@ -167,25 +191,50 @@ public class FvmSolverController : MonoBehaviour
 
             // ----- Init solver -----
             solver = new FvmSolverGpu(cf, rcf);
+
+            velTex = (RenderTexture)solver.GetVelField();
+            presTex = (RenderTexture)solver.GetPresField();
+            flagTex = (RenderTexture)solver.GetFlagField();
+
+            if (cf.grid is NonUniformGridAuto or NonUniformGridDefault)
+            {
+                facePosXArray = solver.GetFacePosXArray();
+                facePosYArray = solver.GetFacePosYArray();
+                facePosZArray = solver.GetFacePosZArray();
+            }
+
             if (simulateBackGroundFlow)
-                solverBackGround = new FvmSolverGpu(bgcf, rcf);
+            {
+                solverBackGround = new FvmSolverGpu(bgcf, rbgcf);
+
+                velTexBackGround = (RenderTexture)solverBackGround.GetVelField();
+                presTexBackGround = (RenderTexture)solverBackGround.GetPresField();
+                flagTexBackGround = (RenderTexture)solverBackGround.GetFlagField();
+
+                if (cf.grid is NonUniformGridAuto or NonUniformGridDefault)
+                {
+                    facePosXArrayBG = solverBackGround.GetFacePosXArray();
+                    facePosYArrayBG = solverBackGround.GetFacePosYArray();
+                    facePosZArrayBG = solverBackGround.GetFacePosZArray();
+                }
+            }
 
             // ----- Init voxelizer -----
             if (model != null && cf.solidType == SolidType.Model)
                 voxelizer = new Voxelizer(cf, rcf, model);
 
             if (simulateBackGroundFlow)
-                voxelizerBackGround = new Voxelizer(bgcf, rcf, model);
+                voxelizerBackGround = new Voxelizer(bgcf, rbgcf, model);
 
-            // ----- Init visualizer -----
-            velTex = (RenderTexture)solver.GetVelField();
-            presTex = (RenderTexture)solver.GetPresField();
-            flagTex = (RenderTexture)solver.GetFlagField();
-            //nutTex = (RenderTexture)solver.GetNutField();
+            // ----- Init visualizer and load colormap -----
             visualizer = new VisualizerGpu(cf, rcf, velTex, presTex, flagTex);
 
-            // ----- Load colormap -----
-            if (colormapCsv != null)
+            if (cf.grid is NonUniformGridDefault)
+            {
+                visualizer.SetFacePosArrays(facePosXArray, facePosYArray, facePosZArray);
+            }
+
+            if (colormapCsv != null && cf.grid is not NonUniformGridAuto)
             {
                 visualizer.LoadColorMapFromCsv(colormapCsv.text);
                 Debug.Log("Colormap loaded from CSV.");
@@ -195,15 +244,16 @@ public class FvmSolverController : MonoBehaviour
             // ----- Init visualization position slider -----
             initSlicePosSlider();
 
-            // ----- Init visualizer for background solver -----
+            // ----- Init visualizer and load colormap for background solver -----
             if (simulateBackGroundFlow)
             {
-                velTexBackGround = (RenderTexture)solverBackGround.GetVelField();
-                presTexBackGround = (RenderTexture)solverBackGround.GetPresField();
-                flagTexBackGround = (RenderTexture)solverBackGround.GetFlagField();
-                visualizerBackGround = new VisualizerGpu(bgcf, rcf, velTexBackGround, presTexBackGround, flagTexBackGround);
+                visualizerBackGround = new VisualizerGpu(bgcf, rbgcf, velTexBackGround, presTexBackGround, flagTexBackGround);
 
-                // ----- Load colormap for background flow -----
+                if (bgcf.grid is NonUniformGridDefault)
+                {
+                    visualizerBackGround.SetFacePosArrays(facePosXArrayBG, facePosYArrayBG, facePosZArrayBG);
+                }
+
                 if (colormapCsv != null)
                 {
                     visualizerBackGround.LoadColorMapFromCsv(colormapCsv.text);
@@ -218,7 +268,17 @@ public class FvmSolverController : MonoBehaviour
             // ----- Init exporter -----
             if ((cf.saveVelField || cf.savePresField) && cf.savePath != null)
             {
-                exporter = new NcFlowFieldExporter(cf, velTex, presTex);
+                if (cf.grid is NonUniformGridAuto or NonUniformGridDefault)
+                    exporter = new NcFlowFieldExporter(cf, rcf, velTex, presTex, facePosXArray, facePosYArray, facePosZArray);
+                else
+                    exporter = new NcFlowFieldExporter(cf, rcf, velTex, presTex);
+            }
+
+            if (cf.saveSampleLine && cf.sampleLines.Count > 0 && cf.grid is NonUniformGridDefault)
+            {
+                lineSampler = new SampleLine(cf, rcf, facePosXArray, facePosYArray, facePosZArray);
+                lineSampleTex = lineSampler.GetSampleLinesTex();
+                sampleLineExporter = new NcSampleLineExporter(cf, rcf, lineSampleTex, facePosXArray, facePosYArray, facePosZArray);
             }
 
             // ----- Init vfx -----
@@ -229,28 +289,51 @@ public class FvmSolverController : MonoBehaviour
             }
 
             // ----- Init vfx textures -----
-            if (targetVfx != null && cf.showVfx)
+            if (cf.grid is not NonUniformGridAuto)
             {
-                targetVfx.SetTexture(velDirSliceVfxName, velDirSliceTex);
-                targetVfx.SetTexture(velFieldVfxName, velTex);
+                if (cf.showVfx)
+                {
+                    if (targetVfx != null)
+                    {
+                        targetVfx.SetTexture(velDirSliceVfxName, velDirSliceTex);
+                        targetVfx.SetTexture(velFieldVfxName, velTex);
+                    }
+
+                    if (particleSystemVfx != null)
+                    {
+                        particleSystemVfx.SetTexture(velDirSliceVfxName, velDirSliceTex);
+                        particleSystemVfx.SetTexture(velFieldVfxName, velTex);
+                    }
+                }
             }
+            
 
             // ----- Init vfx domain size -----
             if (cf.showVfx)
             {
-                if (targetVfx == null)
+                if (targetVfx == null && particleSystemVfx == null)
                 {
-                    Debug.LogError("Target VFX is not assigned.");
+                    Debug.LogError("Target VFX and Particle System VFX are not assigned.");
                 }
                 else
                 {
-                    targetVfx.SetVector3(physDomainSizeVfxName, (Vector3)cf.physDomainSize);
-                    targetVfx.SetVector3(fluidFieldPosVfxName, (Vector3)cf.physFieldPos);
-                    targetVfx.SetBool(vfxArrowLengthFollowVelMagVfxName, cf.vFxArrowLengthFollowVelMag);
+                    if (targetVfx != null)
+                    {
+                        targetVfx.SetVector3(physDomainSizeVfxName, (Vector3)rcf.physDomainSize);
+                        targetVfx.SetVector3(fluidFieldPosVfxName, (Vector3)cf.physFieldPos);
+                        targetVfx.SetBool(vfxArrowLengthFollowVelMagVfxName, cf.vFxArrowLengthFollowVelMag);
+                    }
+
+                    if (particleSystemVfx != null)
+                    {
+                        particleSystemVfx.SetVector3(physDomainSizeVfxName, (Vector3)rcf.physDomainSize);
+                        particleSystemVfx.SetVector3(fluidFieldPosVfxName, (Vector3)cf.physFieldPos);
+                        particleSystemVfx.SetBool(vfxArrowLengthFollowVelMagVfxName, cf.vFxArrowLengthFollowVelMag);
+                    }
                 }
             }
             // ----- Rotate the flow direction arrow -----
-            arrowPosition = (Vector3)cf.physFieldPos + new Vector3(-cf.physDomainSize.x / 2, 0, 0);
+            arrowPosition = (Vector3)cf.physFieldPos + new Vector3(-rcf.physDomainSize.x / 2, 0, 0);
             flowDirArrow.SetVector3(arrowPosVfxName, arrowPosition);
 
             // ----- Init knmi loader -----
@@ -263,6 +346,8 @@ public class FvmSolverController : MonoBehaviour
             confirmPhysFieldPosButton.onClick.AddListener(ConfirmPhysFieldPos);
             confirmOrientationButtion.onClick.AddListener(ConfirmPhysFieldOrientation);
             vfxStartStopButton.onClick.AddListener(VfxStartStop);
+            vfxStartStopButton2.onClick.AddListener(VfxStartStop2);
+            vfxCleanParticlesButton.onClick.AddListener(VfxCleanParticles);
             flowDirectionSlider.onValueChanged.AddListener(SliderUpdateFlowFieldOrientation);
             knmiButton.onClick.AddListener(async () =>
             {
@@ -271,7 +356,7 @@ public class FvmSolverController : MonoBehaviour
             model1Button.onClick.AddListener(LoadModel1);
             model2Button.onClick.AddListener(LoadModel2);
             exitButton.onClick.AddListener(QuitGame);
-            physFieldCoordXField.onEndEdit.AddListener(SetPhysFieldCoordX);
+            physFieldCoordXField.onEndEdit.AddListener(SetPhysFieldCoordX); 
             physFieldCoordYField.onEndEdit.AddListener(SetPhysFieldCoordY);
             physFieldCoordZField.onEndEdit.AddListener(SetPhysFieldCoordZ);
             confirmPhysFieldCoordButton.onClick.AddListener(ConfirmPhysFieldCoord);
@@ -284,6 +369,8 @@ public class FvmSolverController : MonoBehaviour
         else if (cf.mode == Mode.Visualize)
         {
             StartVisualize();
+            
+            initSlicePosSlider();
 
             initTimeSlider();
         }
@@ -315,24 +402,24 @@ public class FvmSolverController : MonoBehaviour
     void initSlicePosSlider()
     {
         slicePosSlider = new VisualizerSlider(
-            config: cf, canvas: canvas, initHandlePos: (float)cf.ySlice / (float)cf.gridRes.y, anchorMin: new Vector2(1.0f, 0.5f), anchorMax: new Vector2(1.0f, 0.5f),
+            config: cf, canvas: canvas, initHandlePos: (float)cf.ySlice / (float)rcf.numCells.y, anchorMin: new Vector2(1.0f, 0.5f), anchorMax: new Vector2(1.0f, 0.5f),
             sliderPos: cf.slicePosSliderPos, sliderSize: cf.slicePosSliderSize, Slider.Direction.BottomToTop
             );
         slicePosSlider.flowSlider.onValueChanged.AddListener(SliderUpdateFlowFieldPosition);
 
-        SliderUpdateFlowFieldPosition((float)cf.ySlice / (float)cf.gridRes.y);
+        //SliderUpdateFlowFieldPosition((float)cf.ySlice / (float)rcf.numCells.y);
     }
 
     void initBackGroundSlicePosSlider()
     {
         backGroundSlicePosSlider = new VisualizerSlider(
-            config: bgcf, canvas: canvas, initHandlePos: (float)bgcf.ySlice / (float)bgcf.gridRes.y, 
+            config: bgcf, canvas: canvas, initHandlePos: (float)bgcf.ySlice / (float)rbgcf.numCells.y, 
             anchorMin: new Vector2(1.0f, 0.5f), anchorMax: new Vector2(1.0f, 0.5f),
             sliderPos: bgcf.slicePosSliderPos, sliderSize: bgcf.slicePosSliderSize, Slider.Direction.BottomToTop
             );
         backGroundSlicePosSlider.flowSlider.onValueChanged.AddListener(BackGroundSliderUpdateFlowFieldPosition);
 
-        BackGroundSliderUpdateFlowFieldPosition((float)bgcf.ySlice / (float)bgcf.gridRes.y);
+        BackGroundSliderUpdateFlowFieldPosition((float)bgcf.ySlice / (float)rbgcf.numCells.y);
     }
 
     void Voxelize()
@@ -340,7 +427,7 @@ public class FvmSolverController : MonoBehaviour
         if (model != null && cf.solidType == SolidType.Model)
         {
             voxelizer = new Voxelizer(cf, rcf, model);
-            int[] flags = voxelizer.VoxelizeMesh();
+            (int[] flags, float maxH) = voxelizer.VoxelizeMesh();
             
             FlagExporter flagExporter = new FlagExporter(cf.flagSavePath);
             flagExporter.ExportFlags(flags);
@@ -349,36 +436,87 @@ public class FvmSolverController : MonoBehaviour
 
     void StartSimulateAndVisualize()
     {
-        if (simulationMode == SimulationMode.CPU)
-        {
-            solver = new FvmSolverCpu(cf);
-            visualizer = new VisualizerCpu(cf, solver);
-
-            if (model != null && cf.solidType == SolidType.Model)
-            {
-                throw new NotImplementedException("Voxelizer is not implemented for CPU mode.");
-            }
-        }
-        else if (simulationMode == SimulationMode.GPU)
+        if (simulationMode == SimulationMode.GPU)
         {
             // ----- Voxelization is executed here instead of Start() to make sure Cesium
             // buildings have been fully loaded -----
             if (model != null && cf.solidType == SolidType.Model)
             {
-                int[] flags = voxelizer.VoxelizeMesh();
-                solver.InitFlags(flags);
+                (int[] flags, float maxH) = voxelizer.VoxelizeMesh();
+                rcf.maxH = maxH;
+                Debug.Log("MaxH: " + maxH);
+
+                // ----- Add non-uniform layers -----
+                if (cf.grid is NonUniformGridAuto grid)
+                {
+                    rcf.InitNonUnifGridAuto(grid, maxH);
+                    rcf.physFieldPos += new float3(0.5f * rcf.physDomainSize.x - rcf.unifRegionPhysStartOffset.x - 0.5f * rcf.unifRegionPhysDomainSize.x, 0, 0);
+
+                    solver.InitNonUnifGridAuto(cf, rcf);
+
+                    facePosXArray = solver.GetFacePosXArray();
+                    facePosYArray = solver.GetFacePosYArray();
+                    facePosZArray = solver.GetFacePosZArray();
+
+                    voxelizer.SetFacePosArrays(facePosXArray, facePosYArray, facePosZArray);
+                    int[] flagsNonUnif = voxelizer.VoxelizeMeshOneColliFillNonUnifRegions();
+
+                    solver.InitNonUnifGridFlags(flagsNonUnif);
+
+                    velTex = solver.GetVelField() as RenderTexture;
+                    presTex = solver.GetPresField() as RenderTexture;
+                    flagTex = solver.GetFlagField() as RenderTexture;
+
+                    visualizer.SetTextures(velTex, presTex, flagTex);
+                    visualizer.AddNonUnifLayers(cf, rcf);
+
+                    visualizer.SetFacePosArrays(facePosXArray, facePosYArray, facePosZArray);
+
+                    if (targetVfx != null)
+                    {
+                        targetVfx.SetVector3(physDomainSizeVfxName, (Vector3)rcf.physDomainSize);
+                        targetVfx.SetVector3(fluidFieldPosVfxName, (Vector3)rcf.physFieldPos);
+                    }
+
+                    if (particleSystemVfx != null)
+                    {
+                        particleSystemVfx.SetVector3(physDomainSizeVfxName, (Vector3)rcf.physDomainSize);
+                        particleSystemVfx.SetVector3(fluidFieldPosVfxName, (Vector3)rcf.physFieldPos);
+                    }
+
+                    // ----- Load colormap -----
+                    if (colormapCsv != null)
+                    {
+                        visualizer.LoadColorMapFromCsv(colormapCsv.text);
+                        Debug.Log("Colormap loaded from CSV.");
+                        cf.colormapLoaded = true;
+                    }
+                }
+                else
+                {
+                    solver.InitFlags(flags);
+                }
 
                 if (simulateBackGroundFlow)
                 {
-                    int[] flagsBackGround = voxelizerBackGround.VoxelizeMesh();
-                    solverBackGround.InitFlags(flagsBackGround);
+                    (int[] flagsBG, float maxHBG) = voxelizerBackGround.VoxelizeMesh();
+                    rbgcf.maxH = maxHBG;
+                    Debug.Log("MaxHBG: " + maxHBG);
+
+                    if (bgcf.grid is NonUniformGridAuto)
+                    {
+                        throw new NotImplementedException();
+                    }
+                    else
+                    {
+                        solverBackGround.InitFlags(flagsBG);
+                    }
                 }
             }
         }
         else
         {
-            Debug.LogError("Invalid simulation mode selected.");
-            return;
+            throw new NotImplementedException("Invalid simulation mode selected.");
         }
     }
 
@@ -453,11 +591,22 @@ public class FvmSolverController : MonoBehaviour
 
     void UpdateSimulateAndVisualize()
     {
+        // ----- Export flow field -----
         if ((cf.saveVelField || cf.savePresField) && cf.savePath != null)
         {
-            if (updateCount % cf.saveInterval == 0 && updateCount >= cf.saveBeginStep)
+            if (updateCount != 0 && updateCount % cf.saveInterval == 0 && updateCount >= cf.saveBeginStep)
             {
                 exporter.EnqueueField();
+            }
+        }
+
+        // ----- Export sample line data -----
+        if (cf.saveSampleLine)
+        {
+            if (updateCount != 0 && updateCount % cf.sampleLineSaveInterval == 0 && updateCount >= cf.sampleLineSaveBeginStep)
+            {
+                lineSampler.SampleLines(velTex);
+                sampleLineExporter.EnqueueSampleLine();
             }
         }
 
@@ -467,6 +616,25 @@ public class FvmSolverController : MonoBehaviour
             if (cf.visualizeMode == VisualizeMode.Copy)
                 visualizer.UpdateVis();
             updateCount++;
+
+            //// ----- Export flow field -----
+            //if ((cf.saveVelField || cf.savePresField) && cf.savePath != null)
+            //{
+            //    if (updateCount != 0 && updateCount % cf.saveInterval == 0 && updateCount >= cf.saveBeginStep)
+            //    {
+            //        exporter.EnqueueField();
+            //    }
+            //}
+
+            //// ----- Export sample line data -----
+            //if (cf.saveSampleLine)
+            //{
+            //    if (updateCount != 0 && updateCount % cf.sampleLineSaveInterval == 0 && updateCount >= cf.sampleLineSaveBeginStep)
+            //    {
+            //        lineSampler.SampleLines(velTex);
+            //        sampleLineExporter.EnqueueSampleLine();
+            //    }
+            //}
         }
 
         if (simulateBackGroundFlow && bgcf != null && bgcf.currSimStep * backGroundFlowUpdateInterval <= cf.currSimStep)
@@ -478,6 +646,14 @@ public class FvmSolverController : MonoBehaviour
                     visualizerBackGround.UpdateVis();
             }
         }
+
+        //if ((cf.saveVelField || cf.savePresField) && cf.savePath != null)
+        //{
+        //    if (updateCount != 0 && updateCount % cf.saveInterval == 0 && updateCount >= cf.saveBeginStep)
+        //    {
+        //        exporter.EnqueueField();
+        //    }
+        //}
     }
 
     void UpdateVisualize()
@@ -504,7 +680,7 @@ public class FvmSolverController : MonoBehaviour
         if (cf.attachFieldToModelBottom)
         {
             float3 physFieldPos = cf.physFieldPos;
-            physFieldPos.y += cf.physDomainSize.y / 2.0f - renderer.bounds.size.y / 2.0f;
+            physFieldPos.y += rcf.physDomainSize.y / 2.0f - renderer.bounds.size.y / 2.0f;
             cf.physFieldPos = physFieldPos;
         }
 
@@ -520,34 +696,78 @@ public class FvmSolverController : MonoBehaviour
         if (model != null && !cf.fieldPositionLocated)
             getFieldPos();
 
-        // ----- Set wireframe angle -----
-        if (rcf != null)
+        // ----- Editor mode -----
+        if (rcf == null)
         {
-            Quaternion rotation = Quaternion.Euler(0f, rcf.flowFieldOrientation, 0f);
-            Gizmos.matrix = Matrix4x4.TRS(cf.physFieldPos, rotation, Vector3.one);
+            if (cf.grid is UniformGrid uniformGrid)
+                physDomainSizeDisplayed = uniformGrid.physDomainSize;
+            else if (cf.grid is NonUniformGridAuto nonUniformGridAuto)
+                physDomainSizeDisplayed = nonUniformGridAuto.unifRegionPhysDomainSize;
+            else if (cf.grid is NonUniformGridDefault nonUniformGridDefault)
+                physDomainSizeDisplayed = nonUniformGridDefault.userDefinedPhysDomainSize;
+
+            if (simulateBackGroundFlow)
+            {
+                if (bgcf.grid is UniformGrid uniformGridBG)
+                    physDomainSizeDisplayedBG = uniformGridBG.physDomainSize;
+                else if (bgcf.grid is NonUniformGridAuto nonUniformGridAutoBG)
+                    physDomainSizeDisplayedBG = nonUniformGridAutoBG.unifRegionPhysDomainSize;
+                else if (bgcf.grid is NonUniformGridDefault nonUniformGridDefaultBG)
+                    physDomainSizeDisplayedBG = nonUniformGridDefaultBG.userDefinedPhysDomainSize;
+            }
+
+            // ----- Only consider position -----
+            Gizmos.matrix = Matrix4x4.Translate(cf.physFieldPos + new float3(0f, physDomainSizeDisplayed.y / 2f, 0f));
         }
+        // ----- Simulation mode -----
         else
         {
-            Gizmos.matrix = Matrix4x4.Translate(cf.physFieldPos);
+            // ----- Consider position and rotation -----
+            Quaternion rotation = Quaternion.Euler(0f, rcf.flowFieldOrientation, 0f);
+            Gizmos.matrix = Matrix4x4.TRS(cf.physFieldPos + new float3(0f, rcf.unifRegionPhysDomainSize.y / 2f, 0f), rotation, Vector3.one);
+
+            // ----- Calculate the physical domain size once -----
+            if (physDomainSizeCalculated == false)
+            {
+                if (cf.grid is UniformGrid uniformGrid)
+                    physDomainSizeDisplayed = uniformGrid.physDomainSize;
+                else if (cf.grid is NonUniformGridAuto nonUniformGridAuto)
+                    physDomainSizeDisplayed = nonUniformGridAuto.unifRegionPhysDomainSize;
+                else if (cf.grid is NonUniformGridDefault nonUniformGridDefault)
+                    physDomainSizeDisplayed = nonUniformGridDefault.userDefinedPhysDomainSize;
+
+                if (simulateBackGroundFlow)
+                {
+                    if (bgcf.grid is UniformGrid uniformGridBG)
+                        physDomainSizeDisplayedBG = uniformGridBG.physDomainSize;
+                    else if (bgcf.grid is NonUniformGridAuto nonUniformGridAutoBG)
+                        physDomainSizeDisplayedBG = nonUniformGridAutoBG.unifRegionPhysDomainSize;
+                    else if (bgcf.grid is NonUniformGridDefault nonUniformGridDefaultBG)
+                        physDomainSizeDisplayedBG = nonUniformGridDefaultBG.userDefinedPhysDomainSize;
+                }
+
+                physDomainSizeCalculated = true;
+            }
         }
 
+        // ----- Draw flow field -----
         Gizmos.color = Color.blue;
-        Gizmos.DrawWireCube(Vector3.zero, cf.physDomainSize);
+        Gizmos.DrawWireCube(Vector3.zero, physDomainSizeDisplayed);
 
         if (simulateBackGroundFlow) 
         {
-            if (rcf != null)
+            if (rcf == null)
             {
-                Quaternion rotation = Quaternion.Euler(0f, rcf.flowFieldOrientation, 0f);
-                Gizmos.matrix = Matrix4x4.TRS(bgcf.physFieldPos, rotation, Vector3.one);
+                Gizmos.matrix = Matrix4x4.Translate(bgcf.physFieldPos + new float3(0f, physDomainSizeDisplayedBG.y / 2f, 0f));
             }
             else
             {
-                Gizmos.matrix = Matrix4x4.Translate(bgcf.physFieldPos);
+                Quaternion rotation = Quaternion.Euler(0f, rcf.flowFieldOrientation, 0f);
+                Gizmos.matrix = Matrix4x4.TRS(bgcf.physFieldPos + new float3(0f, rbgcf.unifRegionPhysDomainSize.y / 2f, 0f), rotation, Vector3.one);
             }
 
             Gizmos.color = Color.green;
-            Gizmos.DrawWireCube(Vector3.zero, bgcf.physDomainSize);
+            Gizmos.DrawWireCube(Vector3.zero, physDomainSizeDisplayedBG);
         }
     }
     #endregion
@@ -559,15 +779,25 @@ public class FvmSolverController : MonoBehaviour
         visualizer.UpdateVis();
 
         // ----- Init vfx textures -----
-        if (targetVfx != null && cf.showVfx)
+        if (cf.showVfx)
         {
-            float physFieldPosVisY = cf.physFieldPos.y * cf.visScale;
-            float physDomainSizeVisY = cf.physDomainSize.y * cf.visScale;
+            float physFieldPosVisY = rcf.physFieldPos.y * cf.visScale;
+            float physDomainSizeVisY = rcf.physDomainSize.y * cf.visScale;
 
-            float quadPhysPosY = (physFieldPosVisY - physDomainSizeVisY / 2.0f) + value * physDomainSizeVisY;
+            //float quadPhysPosY = (physFieldPosVisY - physDomainSizeVisY / 2.0f) + value * physDomainSizeVisY;
+            float quadPhysPosY = physFieldPosVisY + value * physDomainSizeVisY;
 
-            targetVfx.SetFloat(ySlicePosVfxName, value);
-            targetVfx.SetFloat(ySlicePhysPosVfxName, quadPhysPosY);
+            if (targetVfx != null)
+            {
+                targetVfx.SetFloat(ySlicePosVfxName, value);
+                targetVfx.SetFloat(ySlicePhysPosVfxName, quadPhysPosY);
+            }
+
+            if (particleSystemVfx != null)
+            {
+                particleSystemVfx.SetFloat(ySlicePosVfxName, value);
+                particleSystemVfx.SetFloat(ySlicePhysPosVfxName, quadPhysPosY);
+            }
         }
     }
 
@@ -580,6 +810,8 @@ public class FvmSolverController : MonoBehaviour
     public void SliderUpdateFlowFieldOrientation(float value)
     {
         rcf.flowFieldOrientation = value * 360;
+        if (simulateBackGroundFlow)
+            rbgcf.flowFieldOrientation = value * 360;
     }
 
     public void SliderUpdateVisualizationTime(float value)
@@ -594,8 +826,8 @@ public class FvmSolverController : MonoBehaviour
     {
         if (float.TryParse(input, out float newPhysFieldPosX))
         {
-            cf.physFieldPos.x = newPhysFieldPosX;
-            Debug.Log("New PhysFieldPosX: " + cf.physFieldPos.x);
+            rcf.physFieldPos.x = newPhysFieldPosX;
+            Debug.Log("New PhysFieldPosX: " + rcf.physFieldPos.x);
         }
         else
         {
@@ -607,8 +839,8 @@ public class FvmSolverController : MonoBehaviour
     {
         if (float.TryParse(input, out float newPhysFieldPosY))
         {
-            cf.physFieldPos.y = newPhysFieldPosY;
-            Debug.Log("New PhysFieldPosY: " + cf.physFieldPos.y);
+            rcf.physFieldPos.y = newPhysFieldPosY;
+            Debug.Log("New PhysFieldPosY: " + rcf.physFieldPos.y);
         }
         else
         {
@@ -620,8 +852,8 @@ public class FvmSolverController : MonoBehaviour
     {
         if (float.TryParse(input, out float newPhysFieldPosZ))
         {
-            cf.physFieldPos.z = newPhysFieldPosZ;
-            Debug.Log("New PhysFieldPosZ: " + cf.physFieldPos.z);
+            rcf.physFieldPos.z = newPhysFieldPosZ;
+            Debug.Log("New PhysFieldPosZ: " + rcf.physFieldPos.z);
         }
         else
         {
@@ -682,42 +914,38 @@ public class FvmSolverController : MonoBehaviour
             // the foreground fields by interpolating from the background field; if not, re-init
             // from scratch, also move the background field to the new foreground position, and
             // re-init the background field.
-            if (cf.physFieldPos.x - cf.physDomainSize.x / 2 >= bgcf.physFieldPos.x - bgcf.physDomainSize.x / 2 && 
-                cf.physFieldPos.x + cf.physDomainSize.x / 2 <= bgcf.physFieldPos.x + bgcf.physDomainSize.x / 2 &&                 
-                cf.physFieldPos.z - cf.physDomainSize.z / 2 >= bgcf.physFieldPos.z - bgcf.physDomainSize.z / 2 && 
-                cf.physFieldPos.z + cf.physDomainSize.z / 2 <= bgcf.physFieldPos.z + bgcf.physDomainSize.z / 2)
+            if (rcf.physFieldPos.x - rcf.physDomainSize.x / 2 >= rbgcf.physFieldPos.x - rbgcf.physDomainSize.x / 2 &&
+                rcf.physFieldPos.x + rcf.physDomainSize.x / 2 <= rbgcf.physFieldPos.x + rbgcf.physDomainSize.x / 2 &&
+                rcf.physFieldPos.z - rcf.physDomainSize.z / 2 >= rbgcf.physFieldPos.z - rbgcf.physDomainSize.z / 2 &&
+                rcf.physFieldPos.z + rcf.physDomainSize.z / 2 <= rbgcf.physFieldPos.z + rbgcf.physDomainSize.z / 2)
             {
-                solver.InitVelPresFieldsFromBackGroundFlow(bgcf, velTexBackGround, presTexBackGround);
+                solver.InitVelPresFieldsFromBackGroundFlow(bgcf, rbgcf, velTexBackGround, presTexBackGround);
                 visualizer.UpdateQuadPosByConfig();
             }
             else
             {
                 solver.InitVelPresFields();
-                
-                bgcf.physFieldPos = cf.physFieldPos;
+
+                rbgcf.physFieldPos = rcf.physFieldPos;
                 solverBackGround.InitVelPresFields();
-                
+
                 visualizer.UpdateQuadPosByConfig();
                 visualizerBackGround.UpdateQuadPosByConfig();
             }
         }
+        visualizer.UpdateQuadPosByConfig();
 
         // ----- Re-init model and solver -----
         if (model != null && cf.solidType == SolidType.Model)
         {
-            int[] flags = voxelizer.VoxelizeMesh();
+            (int[] flags, float maxH) = voxelizer.VoxelizeMesh();
             solver.InitFlags(flags);
         }
         visualizer.UpdateVis();
 
-        if (cf.showVfx && targetVfx != null)
-        {
-            targetVfx.SetVector3(fluidFieldPosVfxName, (Vector3)cf.physFieldPos);
-        }
-
         // ----- Rotate the flow direction arrow -----
         Quaternion rotation = Quaternion.Euler(0f, rcf.flowFieldOrientation, 0f);
-        arrowPosition = (Vector3)cf.physFieldPos + rotation * new Vector3(-cf.physDomainSize.x / 2, 0, 0);
+        arrowPosition = (Vector3)rcf.physFieldPos + rotation * new Vector3(-rcf.physDomainSize.x / 2, 0, 0);
         flowDirArrow.SetVector3(arrowPosVfxName, arrowPosition);
 
         Debug.Log("PhysFieldPos updated");
@@ -726,7 +954,12 @@ public class FvmSolverController : MonoBehaviour
 
         // ----- Update VFX -----
         if (cf.showVfx)
-            targetVfx.SetVector3(fluidFieldPosVfxName, (Vector3)cf.physFieldPos);
+        {
+            if (targetVfx != null)
+                targetVfx.SetVector3(fluidFieldPosVfxName, (Vector3)rcf.physFieldPos);
+            if (particleSystemVfx != null)
+                particleSystemVfx.SetVector3(fluidFieldPosVfxName, (Vector3)rcf.physFieldPos);
+        }
     }
 
     void ConfirmPhysFieldCoord()
@@ -750,12 +983,12 @@ public class FvmSolverController : MonoBehaviour
         // ----- Re-voxelization -----
         if (model != null && cf.solidType == SolidType.Model)
         {
-            int[] flags = voxelizer.VoxelizeMesh();
+            (int[] flags, float maxH) = voxelizer.VoxelizeMesh();
             solver.InitFlags(flags);
 
             if (simulateBackGroundFlow && bgcf != null)
             {
-                int[] flagsBackGround = voxelizerBackGround.VoxelizeMesh();
+                (int[] flagsBackGround, float maxHBackGround) = voxelizerBackGround.VoxelizeMesh();
                 solverBackGround.InitFlags(flagsBackGround);
             }
         }
@@ -767,12 +1000,17 @@ public class FvmSolverController : MonoBehaviour
 
         // ----- VFX: notify orientation change -----
         flowDirArrow.SetFloat(fluidFieldRotVfxName, rcf.flowFieldOrientation);
-        if (cf.showVfx && targetVfx != null)
-            targetVfx.SetFloat(fluidFieldRotVfxName, rcf.flowFieldOrientation);
+        if (cf.showVfx)
+        {
+            if (targetVfx != null)
+                targetVfx.SetFloat(fluidFieldRotVfxName, rcf.flowFieldOrientation);
+            if (particleSystemVfx != null)
+                particleSystemVfx.SetFloat(fluidFieldRotVfxName, rcf.flowFieldOrientation);
+        }
 
         // ----- VFX: rotate flow direction arrow -----
         Quaternion rotation = Quaternion.Euler(0f, rcf.flowFieldOrientation, 0f);
-        arrowPosition = (Vector3)cf.physFieldPos + rotation * new Vector3(-cf.physDomainSize.x / 2, 0, 0);
+        arrowPosition = (Vector3)cf.physFieldPos + rotation * new Vector3(-rcf.physDomainSize.x / 2, 0, 0);
         flowDirArrow.SetVector3(arrowPosVfxName, arrowPosition);
 
         Debug.Log("PhysField orientation updated");
@@ -784,16 +1022,56 @@ public class FvmSolverController : MonoBehaviour
     {
         if (vfxStarted)
         {
-            targetVfx.SendEvent("StopSpawn");
+            if (targetVfx != null)
+                targetVfx.SendEvent("StopSpawn");
             vfxStarted = false;
             Debug.Log("VFX stopped");
         }
         else
         {
-            targetVfx.SendEvent("StartSpawn");
+            if (targetVfx != null)
+                targetVfx.SendEvent("StartSpawn");
             vfxStarted = true;
             Debug.Log("VFX started");
         }
+    }
+
+    void VfxStartStop2()
+    {
+        if (particleSystemVfxStarted)
+        {
+            if (particleSystemVfx != null)
+                particleSystemVfx.SendEvent("StopSpawn");
+            particleSystemVfxStarted = false;
+            Debug.Log("ParticleSystem VFX stopped");
+        }
+        else
+        {
+            if (particleSystemVfx != null)
+                particleSystemVfx.SendEvent("StartSpawn");
+            particleSystemVfxStarted = true;
+            Debug.Log("ParticleSystem VFX started");
+        }
+    }
+
+    void VfxCleanParticles()
+    {
+        if (targetVfx != null)
+        {
+            targetVfx.Stop();
+            targetVfx.Reinit();
+        }
+
+        if (particleSystemVfx != null)
+        {
+            particleSystemVfx.Stop();
+            particleSystemVfx.Reinit();
+        }
+
+        vfxStarted = false;
+        particleSystemVfxStarted = false;
+
+        Debug.Log("VFX stopped and cleared");
     }
 
     async Task LoadKnmi()
@@ -824,8 +1102,8 @@ public class FvmSolverController : MonoBehaviour
     {
         if (float.TryParse(input, out float newPhysDomainSizeX))
         {
-            cf.physDomainSize.x = newPhysDomainSizeX;
-            Debug.Log("New PhysDomainSizeX: " + cf.physDomainSize.x);
+            rcf.physDomainSize.x = newPhysDomainSizeX;
+            Debug.Log("New PhysDomainSizeX: " + rcf.physDomainSize.x);
         }
         else
         {
@@ -837,8 +1115,8 @@ public class FvmSolverController : MonoBehaviour
     {
         if (float.TryParse(input, out float newPhysDomainSizeY))
         {
-            cf.physDomainSize.y = newPhysDomainSizeY;
-            Debug.Log("New PhysDomainSizeY: " + cf.physDomainSize.y);
+            rcf.physDomainSize.y = newPhysDomainSizeY;
+            Debug.Log("New PhysDomainSizeY: " + rcf.physDomainSize.y);
         }
         else
         {
@@ -850,8 +1128,8 @@ public class FvmSolverController : MonoBehaviour
     {
         if (float.TryParse(input, out float newPhysDomainSizeZ))
         {
-            cf.physDomainSize.z = newPhysDomainSizeZ;
-            Debug.Log("New PhysDomainSizeZ: " + cf.physDomainSize.z);
+            rcf.physDomainSize.z = newPhysDomainSizeZ;
+            Debug.Log("New PhysDomainSizeZ: " + rcf.physDomainSize.z);
         }
         else
         {
@@ -869,7 +1147,7 @@ public class FvmSolverController : MonoBehaviour
         // ----- Re-init model and solver -----
         if (model != null && cf.solidType == SolidType.Model)
         {
-            int[] flags = voxelizer.VoxelizeMesh();
+            (int[] flags, float maxH) = voxelizer.VoxelizeMesh();
             solver.InitFlags(flags);
         }
 
@@ -928,6 +1206,10 @@ public class FvmSolverController : MonoBehaviour
             if ((cf.saveVelField || cf.savePresField) && cf.savePath != null)
             {
                 exporter.CloseNcFile();
+            }
+            if (cf.saveSampleLine && cf.sampleLines.Count > 0 && cf.grid is NonUniformGridDefault)
+            {
+                sampleLineExporter.CloseNcFile();
             }
         }
         else if (cf.mode == Mode.Visualize)

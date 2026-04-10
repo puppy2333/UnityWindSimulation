@@ -10,12 +10,12 @@ MonoBehaviour:
   m_Enabled: 1
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 91b4ae8ce0447c74e83db2ff9bad71a7, type: 3}
-  m_Name: CesiumBackGroundConfig
+  m_Name: BuildingGroupConfig
   m_EditorClassIdentifier: 
   mode: 0
   grid:
-    rid: 6560383611104919624
-  dt: 0.08
+    rid: 6560383653978570759
+  dt: 0.02
   mu: 0.000015
   den: 1
   externalForce:
@@ -35,7 +35,7 @@ MonoBehaviour:
   presBndCondZ0: 2
   presBndCondZn: 2
   velX0:
-    x: 5
+    x: 7
     y: 0
     z: 0
   velZn:
@@ -51,12 +51,12 @@ MonoBehaviour:
   smagorinskyConstant: 0.15
   inflowType: 1
   calResidual: 1
-  calMaxCfl: 0
-  velResidualCheckInterval: 40
-  velTolerance: 1e-15
+  calMaxCfl: 1
+  velResidualCheckInterval: 50
+  velTolerance: 0.00001
   velMaxNumIter: 100
-  presResidualCheckInterval: 40
-  presTolerance: 0.0001
+  presResidualCheckInterval: 50
+  presTolerance: 0.00001
   presMaxNumIter: 1000
   visualizeMode: 0
   colorMap: 0
@@ -64,63 +64,63 @@ MonoBehaviour:
   showPressureField: 0
   showFlagField: 0
   showVfx: 0
-  vFxArrowLengthFollowVelMag: 0
-  ySlice: 2
+  vFxArrowLengthFollowVelMag: 1
+  ySlice: 10
   minVel: 0
-  maxVel: 20
-  minPres: -5000
-  maxPres: 5000
-  cameraHeight: 100
+  maxVel: 15
+  minPres: -50
+  maxPres: 50
+  cameraHeight: 80
   cameraAngle: 60
-  showSimulationTime: 0
-  showDomainBoundary: 1
+  showSimulationTime: 1
+  showDomainBoundary: 0
   visScale: 1
   visInterpolateType: 0
   voxelizerType: 0
   attachFieldToModelBottom: 0
   simulateGround: 0
   physFieldPos:
-    x: 0
+    x: 10
     y: 0
     z: 0
-  showVoxelization: 0
-  slicePosSliderPos: {x: -20, y: 0}
+  showVoxelization: 1
+  slicePosSliderPos: {x: -350, y: 0}
   slicePosSliderSize: {x: 20, y: 300}
-  timeSliderPos: {x: 0, y: 50}
+  timeSliderPos: {x: 0, y: 300}
   timeSliderSize: {x: 300, y: 20}
-  saveVelField: 0
+  saveVelField: 1
   savePresField: 0
   saveSampleLine: 0
   useAbsSaveDir: 0
   absSaveDir: D:/Projects/Unity/UnityProjects/TestWindNoiseSimulation/Data
-  saveBeginStep: 50
+  saveBeginStep: 0
   saveInterval: 50
-  flagFileName: BuildingGroupFloor
+  flagFileName: BuildingGroup
   sampleLineSaveBeginStep: 0
   sampleLineSaveInterval: 10
   sampleLines: []
   useAbsReadDir: 0
   absReadDir: D:/Projects/Unity/UnityProjects/TestWindNoiseSimulation/Data
-  readFileName: Field_20251125_181013.nc
+  readFileName: Field_20260408_163540.nc
   references:
     version: 2
     RefIds:
-    - rid: 6560383611104919624
+    - rid: 6560383653978570759
       type: {class: NonUniformGridDefault, ns: , asm: Assembly-CSharp}
       data:
         userDefinedPhysDomainSize:
-          x: 800
-          y: 80
-          z: 800
+          x: 200
+          y: 20
+          z: 150
         unifRegionPhysStartOffset:
           x: 0
           y: 0
           z: 0
         unifRegionPhysDomainSize:
-          x: 800
-          y: 80
-          z: 800
-        unifRegionNumCellsX: 200
+          x: 200
+          y: 20
+          z: 150
+        unifRegionNumCellsX: 400
         stretchFactor:
           x: 1.08
           y: 1.08

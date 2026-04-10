@@ -27,6 +27,7 @@ public class NcFlowFieldExporter
 {
     #region ReferenceVariables
     FluidSimConfig cf;
+    RuntimeConfig rcf;
 
     IFvmSolver solver;
 
@@ -96,6 +97,12 @@ public class NcFlowFieldExporter
     IntPtr[] presFieldWriteCount = new IntPtr[4];
     #endregion
 
+    #region
+    float[] facePosXArray;
+    float[] facePosYArray;
+    float[] facePosZArray;
+    #endregion
+
     #region ErrorHandling
     int status;
     string errorMsg;
@@ -108,14 +115,22 @@ public class NcFlowFieldExporter
     #endregion
 
     #region Initialization
-    public NcFlowFieldExporter(FluidSimConfig configIn, RenderTexture velField, RenderTexture presField)
+    public NcFlowFieldExporter(
+        FluidSimConfig configIn, RuntimeConfig rcfIn,
+        RenderTexture velField, RenderTexture presField,
+        float[] facePosXArrayIn = null, float[] facePosYArrayIn = null, float[] facePosZArrayIn = null)
     {
         cf = configIn;
+        rcf = rcfIn;
 
         if (cf.mode == Mode.SimulateAndVisualize)
         {
             velFieldGpu = velField;
             presFieldGpu = presField;
+
+            facePosXArray = facePosXArrayIn;
+            facePosYArray = facePosYArrayIn;
+            facePosZArray = facePosZArrayIn;
 
             MallocNcVariables();
 
@@ -125,42 +140,81 @@ public class NcFlowFieldExporter
         }
     }
 
+    void FillUnifGridCoords()
+    {
+        for (int x = 0; x < rcf.numCells.x; x++)
+        {
+            velXValues[x] = (x + 0.5f) * rcf.dxUnif;
+        }
+        for (int y = 0; y < rcf.numCells.y; y++)
+        {
+            velYValues[y] = (y + 0.5f) * rcf.dxUnif;
+        }
+        for (int z = 0; z < rcf.numCells.z; z++)
+        {
+            velZValues[z] = (z + 0.5f) * rcf.dxUnif;
+        }
+        for (int x = 0; x < rcf.numCells.x; x++)
+        {
+            presXValues[x] = (x + 0.5f) * rcf.dxUnif;
+        }
+        for (int y = 0; y < rcf.numCells.y; y++)
+        {
+            presYValues[y] = (y + 0.5f) * rcf.dxUnif;
+        }
+        for (int z = 0; z < rcf.numCells.z; z++)
+        {
+            presZValues[z] = (z + 0.5f) * rcf.dxUnif;
+        }
+    }
+
+    void FillNonUnifGridCoords()
+    {
+        for (int x = 0; x < rcf.numCells.x; x++)
+        {
+            velXValues[x] = (facePosXArray[x] + facePosXArray[x + 1]) / 2.0f;
+        }
+        for (int y = 0; y < rcf.numCells.y; y++)
+        {
+            velYValues[y] = (facePosYArray[y] + facePosYArray[y + 1]) / 2.0f;
+        }
+        for (int z = 0; z < rcf.numCells.z; z++)
+        {
+            velZValues[z] = (facePosZArray[z] + facePosZArray[z + 1]) / 2.0f;
+        }
+        for (int x = 0; x < rcf.numCells.x; x++)
+        {
+            presXValues[x] = (facePosXArray[x] + facePosXArray[x + 1]) / 2.0f;
+        }
+        for (int y = 0; y < rcf.numCells.y; y++)
+        {
+            presYValues[y] = (facePosYArray[y] + facePosYArray[y + 1]) / 2.0f;
+        }
+        for (int z = 0; z < rcf.numCells.z; z++)
+        {
+            presZValues[z] = (facePosZArray[z] + facePosZArray[z + 1]) / 2.0f;
+        }
+    }
+
     void MallocNcVariables()
     {
         dtList = new float[1];
 
         timeValues = new float[1];
-        velXValues = new float[cf.velRes.x];
-        velYValues = new float[cf.velRes.y];
-        velZValues = new float[cf.velRes.z];
+        velXValues = new float[rcf.numCells.x];
+        velYValues = new float[rcf.numCells.y];
+        velZValues = new float[rcf.numCells.z];
         velVecValues = new int[4];
-        presXValues = new float[cf.presRes.x];
-        presYValues = new float[cf.presRes.y];
-        presZValues = new float[cf.presRes.z];
-
-        for (int x = 0; x < cf.velRes.x; x++)
+        presXValues = new float[rcf.numCells.x];
+        presYValues = new float[rcf.numCells.y];
+        presZValues = new float[rcf.numCells.z];
+        if (cf.grid is UniformGrid)
         {
-            velXValues[x] = (x + 0.5f) * cf.dx;
+            FillUnifGridCoords();
         }
-        for (int y = 0; y < cf.velRes.y; y++)
+        else if (cf.grid is NonUniformGridAuto or NonUniformGridDefault)
         {
-            velYValues[y] = (y + 0.5f) * cf.dx;
-        }
-        for (int z = 0; z < cf.velRes.z; z++)
-        {
-            velZValues[z] = (z + 0.5f) * cf.dx;
-        }
-        for (int x = 0; x < cf.presRes.x; x++)
-        {
-            presXValues[x] = (x + 0.5f) * cf.dx;
-        }
-        for (int y = 0; y < cf.presRes.y; y++)
-        {
-            presYValues[y] = (y + 0.5f) * cf.dx;
-        }
-        for (int z = 0; z < cf.presRes.z; z++)
-        {
-            presZValues[z] = (z + 0.5f) * cf.dx;
+            FillNonUnifGridCoords();
         }
 
         velVecValues[0] = 0;
@@ -178,9 +232,9 @@ public class NcFlowFieldExporter
         velFieldWriteStart[4] = (IntPtr)0;
 
         velFieldWriteCount[0] = (IntPtr)1;
-        velFieldWriteCount[1] = (IntPtr)cf.velRes.z;
-        velFieldWriteCount[2] = (IntPtr)cf.velRes.y;
-        velFieldWriteCount[3] = (IntPtr)cf.velRes.x;
+        velFieldWriteCount[1] = (IntPtr)rcf.numCells.z;
+        velFieldWriteCount[2] = (IntPtr)rcf.numCells.y;
+        velFieldWriteCount[3] = (IntPtr)rcf.numCells.x;
         velFieldWriteCount[4] = (IntPtr)4;
 
         presFieldWriteStart[0] = (IntPtr)0;
@@ -189,9 +243,9 @@ public class NcFlowFieldExporter
         presFieldWriteStart[3] = (IntPtr)0;
 
         presFieldWriteCount[0] = (IntPtr)1;
-        presFieldWriteCount[1] = (IntPtr)cf.presRes.z;
-        presFieldWriteCount[2] = (IntPtr)cf.presRes.y;
-        presFieldWriteCount[3] = (IntPtr)cf.presRes.x;
+        presFieldWriteCount[1] = (IntPtr)rcf.numCells.z;
+        presFieldWriteCount[2] = (IntPtr)rcf.numCells.y;
+        presFieldWriteCount[3] = (IntPtr)rcf.numCells.x;
     }
 
     void SetUpNcFile()
@@ -202,13 +256,13 @@ public class NcFlowFieldExporter
 
         // Define dimensions.
         status = CsNetCDF.NetCDF.nc_def_dim(fileId, "time", (IntPtr)CsNetCDF.NetCDF.NC_UNLIMITED, out dimTimeId);
-        status = CsNetCDF.NetCDF.nc_def_dim(fileId, "velX", (IntPtr)cf.velRes.x, out dimVelXId);
-        status = CsNetCDF.NetCDF.nc_def_dim(fileId, "velY", (IntPtr)cf.velRes.y, out dimVelYId);
-        status = CsNetCDF.NetCDF.nc_def_dim(fileId, "velZ", (IntPtr)cf.velRes.z, out dimVelZId);
+        status = CsNetCDF.NetCDF.nc_def_dim(fileId, "velX", (IntPtr)rcf.numCells.x, out dimVelXId);
+        status = CsNetCDF.NetCDF.nc_def_dim(fileId, "velY", (IntPtr)rcf.numCells.y, out dimVelYId);
+        status = CsNetCDF.NetCDF.nc_def_dim(fileId, "velZ", (IntPtr)rcf.numCells.z, out dimVelZId);
         status = CsNetCDF.NetCDF.nc_def_dim(fileId, "velVec", (IntPtr)4, out dimVelVecId);
-        status = CsNetCDF.NetCDF.nc_def_dim(fileId, "presX", (IntPtr)cf.presRes.x, out dimPresXId);
-        status = CsNetCDF.NetCDF.nc_def_dim(fileId, "presY", (IntPtr)cf.presRes.y, out dimPresYId);
-        status = CsNetCDF.NetCDF.nc_def_dim(fileId, "presZ", (IntPtr)cf.presRes.z, out dimPresZId);
+        status = CsNetCDF.NetCDF.nc_def_dim(fileId, "presX", (IntPtr)rcf.numCells.x, out dimPresXId);
+        status = CsNetCDF.NetCDF.nc_def_dim(fileId, "presY", (IntPtr)rcf.numCells.y, out dimPresYId);
+        status = CsNetCDF.NetCDF.nc_def_dim(fileId, "presZ", (IntPtr)rcf.numCells.z, out dimPresZId);
         CheckError("Define dimension error: ");
 
         dimTimeIdArray[0] = dimTimeId;
@@ -221,7 +275,7 @@ public class NcFlowFieldExporter
         dimPresZIdArray[0] = dimPresZId;
 
         // Define meta data.
-        string gridLayoutType = cf.gridType.ToString();
+        string gridLayoutType = cf.grid.GetType().ToString();
         //Debug.Log("Length: " + gridLayoutType.Length);
         status = CsNetCDF.NetCDF.nc_put_att_text(fileId, CsNetCDF.NetCDF.NC_GLOBAL, "gridLayoutType", (IntPtr)gridLayoutType.Length, gridLayoutType);
         CheckError("Write gridLayoutType error: ");
@@ -298,7 +352,9 @@ public class NcFlowFieldExporter
 
         if (cf.saveVelField)
         {
-            var velNativeArray = new NativeArray<float>(cf.velRes.x * cf.velRes.y * cf.velRes.z * 4, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+            var velNativeArray = new NativeArray<float>(
+                rcf.numCells.x * rcf.numCells.y * rcf.numCells.z * 4, Allocator.Persistent,
+                NativeArrayOptions.UninitializedMemory);
 
             AsyncGPUReadback.RequestIntoNativeArray(ref velNativeArray, velFieldGpu, 0, request =>
             {
@@ -317,7 +373,7 @@ public class NcFlowFieldExporter
         }
         if (cf.savePresField)
         {
-            var presNativeArray = new NativeArray<float>(cf.presRes.x * cf.presRes.y * cf.presRes.z, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+            var presNativeArray = new NativeArray<float>(rcf.numCells.x * rcf.numCells.y * rcf.numCells.z, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
 
             AsyncGPUReadback.RequestIntoNativeArray(ref presNativeArray, presFieldGpu, 0, request =>
             {

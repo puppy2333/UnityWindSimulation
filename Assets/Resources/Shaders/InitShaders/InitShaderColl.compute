@@ -23,6 +23,7 @@ RWTexture3D<float4> velField;
 RWTexture3D<float4> velFieldLastTime;
 RWTexture3D<float4> velFieldLastIter;
 RWTexture3D<float4> velCorrectField;
+RWTexture3D<float4> massFluxField;
 
 RWTexture3D<float> presFieldLastTime;
 RWTexture3D<float> presCorrectField;
@@ -60,8 +61,8 @@ int2 jetCenter;
 float3 velX0;
 float3 velZn;
 
-float3 boxStart;
-float3 boxEnd;
+int3 boxStartIdx;
+int3 boxEndIdx;
 
 float3 internalVelField;
 
@@ -117,7 +118,7 @@ void CSInitLogVelPresFields(uint3 id : SV_DispatchThreadID)
     if (x >= int(gridRes.x) || y >= int(gridRes.y) || z >= int(gridRes.z))
         return;
     
-    float yPhys = y * dx;
+    float yPhys = (y + 0.5) * dx;
     float fricVel = karmanConst * internalVelField.x / log((refHeight + roughParam) / roughParam);
     float vel = fricVel / karmanConst * log((yPhys + roughParam) / roughParam);
     
@@ -147,6 +148,11 @@ void CSInitLogVelPresFieldsNonUniform(uint3 id : SV_DispatchThreadID)
     velFieldLastTime[id] = float4(vel, 0, 0, 0);
     velFieldLastIter[id] = float4(vel, 0, 0, 0);
     velCorrectField[id] = float4(0, 0, 0, 0);
+    
+    float dy = facePosY[y + 1] - facePosY[y];
+    float dz = facePosZ[z + 1] - facePosZ[z];
+    float dsx = dy * dz;
+    massFluxField[id] = float4(vel * dsx, 0, 0, 0);
     
     presFieldLastTime[id] = 0.0f;
     presCorrectField[id] = 0.0f;
@@ -317,13 +323,33 @@ void CSInitBoxFlag(uint3 id : SV_DispatchThreadID)
     //    velFieldLastTime[id] = float4(0, 0, 0, 0);
     //}
     
-    if (x >= 20 && x < 24 && y >= 0 && y < 8 && z >= 18 && z < 22)
+    if (x >= boxStartIdx.x && x < boxEndIdx.x &&
+        y >= boxStartIdx.y && y < boxEndIdx.y &&
+        z >= boxStartIdx.z && z < boxEndIdx.z)
     {
         flagField[id] = CELL_SOLID;
         velField[id] = float4(0, 0, 0, 0);
         velFieldLastIter[id] = float4(0, 0, 0, 0);
         velFieldLastTime[id] = float4(0, 0, 0, 0);
     }
+    
+    //if (x >= 80 && x < 96 &&
+    //    y >= 0 && y < 32 &&
+    //    z >= 72 && z < 88)
+    //{
+    //    flagField[id] = CELL_SOLID;
+    //    velField[id] = float4(0, 0, 0, 0);
+    //    velFieldLastIter[id] = float4(0, 0, 0, 0);
+    //    velFieldLastTime[id] = float4(0, 0, 0, 0);
+    //}
+    
+    //if (x >= 20 && x < 24 && y >= 0 && y < 8 && z >= 18 && z < 22)
+    //{
+    //    flagField[id] = CELL_SOLID;
+    //    velField[id] = float4(0, 0, 0, 0);
+    //    velFieldLastIter[id] = float4(0, 0, 0, 0);
+    //    velFieldLastTime[id] = float4(0, 0, 0, 0);
+    //}
     
     //if (x >= 40 && x < 48 && y >= 0 && y < 16 && z >= 36 && z < 44)
     //{

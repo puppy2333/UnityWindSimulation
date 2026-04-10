@@ -17,8 +17,6 @@
 // ----- Residual calculation -----
 #pragma kernel CSComputeVelPredictResidual
 #pragma kernel CSComputePresCorrectResidual
-// ----- Calculate CFL number -----
-#pragma kernel CSCalCfl
 
 
 // Create a RenderTexture with enableRandomWrite flag and set it
@@ -48,9 +46,6 @@ RWTexture3D<float> bFieldPresCorrect;
 // matrix residual of each thread group.
 RWStructuredBuffer<float> gloResBuf;
 
-// Buffer with size numGroupX * numGroupY * numGroupZ. Used to store per-group CFL values.
-RWStructuredBuffer<float> gloCflBuf;
-
 // Aod * U correction field for PISO.
 RWTexture3D<float4> AodUCorrectField;
 
@@ -65,7 +60,7 @@ Texture2D<float4> bndFieldZn;
 
 int3 gridRes;
 int3 velRes;
-//int3 presRes;
+int3 presRes;
 float dt;
 float dx;
 float ds;
@@ -90,7 +85,6 @@ int presBndTypeZ0;
 int presBndTypeZn;
 
 groupshared float groupResBuf[groupSize.x * groupSize.y * groupSize.z];
-groupshared float groupCflBuf[groupSize.x * groupSize.y * groupSize.z];
 
 // ----- LES (read-only) -----
 bool useLES;
@@ -2476,7 +2470,7 @@ void CSPresNormalization(uint3 id : SV_DispatchThreadID)
     
     //float refPres = presFieldLastTime[int3(gridRes.x / 2, gridRes.y / 2, gridRes.z / 2)];
     //float refPres = presFieldLastTime[int3(2, 2, 2)];
-    float refPres = presFieldLastTime[int3(2, gridRes.y / 2, 2)];
+    float refPres = presFieldLastTime[int3(2, presRes.y / 2, 2)];
     
     presFieldLastTime[id] -= refPres;
 }
@@ -2760,39 +2754,6 @@ void CSComputeVelPredictResidual(uint3 id : SV_DispatchThreadID, uint3 groupId :
     {
         int idGloResBuf = groupId.z * (numGroups.x * numGroups.y) + groupId.y * numGroups.x + groupId.x;
         gloResBuf[idGloResBuf] = groupResBuf[0];
-    }
-}
-
-[numthreads(8, 8, 8)]
-void CSCalCfl(uint3 id : SV_DispatchThreadID, uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID)
-{
-    int x = id.x, y = id.y, z = id.z;
-
-    float locCfl = 0;
-
-    if (x < gridRes.x && y < gridRes.y && z < gridRes.z)
-    {
-        locCfl = abs(velField[id].x) * dt / dx + abs(velField[id].y) * dt / dx + abs(velField[id].z) * dt / dx;
-    }
-
-    uint groupThreadIndex = groupThreadId.z * (groupSize.x * groupSize.y) + groupThreadId.y * groupSize.x + groupThreadId.x;
-    groupCflBuf[groupThreadIndex] = locCfl;
-
-    GroupMemoryBarrierWithGroupSync();
-
-    for (uint stride = (groupSize.x * groupSize.y * groupSize.z) / 2; stride > 0; stride /= 2)
-    {
-        if (groupThreadIndex < stride)
-        {
-            groupCflBuf[groupThreadIndex] = max(groupCflBuf[groupThreadIndex], groupCflBuf[groupThreadIndex + stride]);
-        }
-        GroupMemoryBarrierWithGroupSync();
-    }
-
-    if (groupThreadIndex == 0)
-    {
-        int idGloCflBuf = groupId.z * (numGroups.x * numGroups.y) + groupId.y * numGroups.x + groupId.x;
-        gloCflBuf[idGloCflBuf] = groupCflBuf[0];
     }
 }
 

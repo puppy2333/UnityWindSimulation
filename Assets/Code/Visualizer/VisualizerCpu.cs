@@ -41,7 +41,7 @@ public class VisualizerCpu : IVisualizer
     float2 kGreenVec2 = new(4.27729857f, 2.82956604f);
     float2 kBlueVec2 = new(-89.90310912f, 27.34824973f);
 
-    public VisualizerCpu(FluidSimConfig config, IFvmSolver solverIn)
+    public VisualizerCpu(FluidSimConfig config, RuntimeConfig rcf, IFvmSolver solverIn)
     {
         solver = solverIn;
 
@@ -54,8 +54,8 @@ public class VisualizerCpu : IVisualizer
         cf = config;
         cf.Init();
 
-        physicalDomainSize = cf.physDomainSize;
-        gridResX = cf.gridResX;
+        physicalDomainSize = rcf.physDomainSize;
+        gridResX = rcf.numCells.x;
         colorMap = cf.colorMap;
 
         // Init fluid simulation parameters.
@@ -237,5 +237,25 @@ public class VisualizerCpu : IVisualizer
     public RenderTexture GetVelMagSliceTex()
     {
         throw new NotImplementedException("GetVelMagSliceTex is not implemented for CPU visualizer.");
+    }
+
+    public void SetFacePosArrays(float[] facePosXArrayIn, float[] facePosYArrayIn, float[] facePosZArrayIn)
+    {
+        throw new NotImplementedException("SetFacePosArrays is not implemented for CPU visualizer.");
+    }
+
+    public void SetTextures(RenderTexture velSimTexIn, RenderTexture presSimTexIn, RenderTexture flagSimTexIn)
+    {
+        throw new NotImplementedException("SetTextures is not implemented for CPU visualizer.");
+    }
+
+    public void LoadConfig(FluidSimConfig config, RuntimeConfig rcfIn)
+    {
+        throw new NotImplementedException("LoadConfig is not implemented for CPU visualizer.");
+    }
+
+    public void AddNonUnifLayers(FluidSimConfig cfIn, RuntimeConfig rcfIn)
+    {
+        throw new NotImplementedException("AddNonUnifLayers is not implemented for CPU visualizer.");
     }
 }

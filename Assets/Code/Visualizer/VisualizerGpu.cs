@@ -37,6 +37,22 @@ public class VisualizerGpu : IVisualizer
     Material presMaterial;
     Material flagMaterial;
 
+    // ----- Face pos arrays for non-uniform grid -----
+    float[] facePosXArray;
+    float[] facePosYArray;
+    float[] facePosZArray;
+
+    // ----- XYZ map texture for non-uniform grid -----
+    Texture2D xMapTex;
+    Texture2D yMapTex;
+    Texture2D zMapTex;
+
+    float[] xMapArray;
+    float[] yMapArray;
+    float[] zMapArray;
+
+    int xyzMapTexSize = 2048;
+
     // Shader kernels
     int visVelKernel;
     int visVelDirKernel;
@@ -66,54 +82,61 @@ public class VisualizerGpu : IVisualizer
     private float3 physFieldPosVis;
     private float3 physDomainSizeVis;
 
-    public VisualizerGpu(FluidSimConfig config, RuntimeConfig rcfIn, RenderTexture velIn, RenderTexture presIn, RenderTexture flagIn)
+    public VisualizerGpu(
+        FluidSimConfig cfIn, RuntimeConfig rcfIn, 
+        RenderTexture velIn, RenderTexture presIn, RenderTexture flagIn)
     {
+        // Load configuration file and initialize simulation parameters.
+        LoadConfig(cfIn, rcfIn);
+
         // Store the solver to be visualized.
         velSimTex = velIn;
         presSimTex = presIn;
         flagSimTex = flagIn;
 
-        // Load configuration file and initialize simulation parameters.
-        LoadConfig(config);
-        rcf = rcfIn;
-
-        // ----- Malloc all textures -----
-        MallocSliceTex();
-        MallocVfxTex();
-        MallocColorMapTex();
-
-        // Pressure field visualization.
-        if (cf.showVelocityField == true)
+        if (cf.grid is not NonUniformGridAuto)
         {
-            InitVelQuad();
-        }
-        if (cf.showPressureField == true)
-        {
-            InitPresQuad();
-        }
-        if (cf.showFlagField == true)
-        {
-            InitFlagQuad();
-        }
+            // ----- Malloc all textures -----
+            MallocSliceTex();
+            MallocVfxTex();
+            MallocColorMapTex();
 
-        // Find the compute shader kernels.
-        ComputeShader visShaderAsset = Resources.Load<ComputeShader>("Shaders/VisShaders/VisShader");
-        visShader = UnityEngine.Object.Instantiate(visShaderAsset);
+            if (cf.grid is NonUniformGridAuto or NonUniformGridDefault)
+                MallocXYZMapTex();
 
-        SetSimShaderParameters();
-        RegisterKernels();
+            // Pressure field visualization.
+            if (cf.showVelocityField == true)
+            {
+                InitVelQuad();
+            }
+            if (cf.showPressureField == true)
+            {
+                InitPresQuad();
+            }
+            if (cf.showFlagField == true)
+            {
+                InitFlagQuad();
+            }
+
+            // Find the compute shader kernels.
+            ComputeShader visShaderAsset = Resources.Load<ComputeShader>("Shaders/VisShaders/VisShader");
+            visShader = UnityEngine.Object.Instantiate(visShaderAsset);
+
+            SetSimShaderParameters();
+            RegisterKernels();
+        }
     }
 
-    void LoadConfig(FluidSimConfig config)
+    public void LoadConfig(FluidSimConfig config, RuntimeConfig rcfIn)
     {
         cf = config;
+        rcf = rcfIn;
 
         // Init simulation parameters.
-        physicalDomainSize = cf.physDomainSize;
-        gridResX = cf.gridResX;
+        physicalDomainSize = rcf.physDomainSize;
         colorMap = cf.colorMap;
-        dx = cf.dx;
-        gridRes = cf.gridRes;
+        dx = rcf.dxUnif;
+        gridRes = rcf.numCells;
 
         // Init visualization parameters.
         ySliceRunTime = cf.ySlice;
@@ -125,8 +148,9 @@ public class VisualizerGpu : IVisualizer
         cameraAngle = cf.cameraAngle;
 
         // Model parameters.
-        physFieldPosVis = cf.physFieldPos * cf.visScale;
-        physDomainSizeVis = cf.physDomainSize * cf.visScale;
+        //physFieldPosVis = cf.physFieldPos * cf.visScale + new float3(0, 100, 0);
+        physFieldPosVis = rcf.physFieldPos * cf.visScale;
+        physDomainSizeVis = rcf.physDomainSize * cf.visScale;
 
         if (ySliceRunTime < 0 || ySliceRunTime >= gridRes.y)
         {
@@ -189,6 +213,25 @@ public class VisualizerGpu : IVisualizer
     void MallocColorMapTex()
     {
         colormapArray = new Color[256];
+    }
+
+    void MallocXYZMapTex()
+    {
+        xMapTex = new Texture2D(2048, 1, TextureFormat.RFloat, false);
+        yMapTex = new Texture2D(2048, 1, TextureFormat.RFloat, false);
+        zMapTex = new Texture2D(2048, 1, TextureFormat.RFloat, false);
+
+        xMapTex.filterMode = FilterMode.Point;
+        xMapTex.wrapMode = TextureWrapMode.Clamp;
+        xMapTex.Apply();
+
+        yMapTex.filterMode = FilterMode.Point;
+        yMapTex.wrapMode = TextureWrapMode.Clamp;
+        yMapTex.Apply();
+
+        zMapTex.filterMode = FilterMode.Point;
+        zMapTex.wrapMode = TextureWrapMode.Clamp;
+        zMapTex.Apply();
     }
 
     public void LoadColorMapFromCsv(string csvText)
@@ -269,11 +312,23 @@ public class VisualizerGpu : IVisualizer
         }
         else
         {
-            velMaterial = new Material(Shader.Find("Custom/VisShaderVel"));
+            if (cf.grid is UniformGrid)
+            {
+                velMaterial = new Material(Shader.Find("Custom/VisShaderVel"));
+            }
+            else if (cf.grid is NonUniformGridAuto or NonUniformGridDefault)
+            {
+                velMaterial = new Material(Shader.Find("Custom/VisShaderVelNonUnif"));
+                velMaterial.SetTexture("_XMapTex", xMapTex);
+                velMaterial.SetTexture("_YMapTex", yMapTex);
+                velMaterial.SetTexture("_ZMapTex", zMapTex);
+            }
             velMaterial.SetTexture("_VelSimTex", velSimTex);
         }
 
         velQuad.GetComponent<Renderer>().material = velMaterial;
+
+        Debug.Log($"velQuad.transform.localScale: {velQuad.transform.localScale}");
     }
 
     void InitPresQuad()
@@ -382,6 +437,7 @@ public class VisualizerGpu : IVisualizer
         visFlagKernel = visShader.FindKernel("CSVisFlag");
     }
 
+    // ----- This function is not called if visualization mode is zero-copy -----
     public void UpdateVis()
     {
         //Debug.Assert(velSimTex != null, "Velocity simulation texture is null.");
@@ -390,31 +446,18 @@ public class VisualizerGpu : IVisualizer
 
         if (cf.showVelocityField == true)
         {
-            if (cf.gridType == GridType.Collocated || cf.gridType == GridType.CollNonUniform)
+            if (cf.colormapLoaded)
             {
-                if (cf.colormapLoaded)
-                {
-                    visShader.SetTexture(visVelKernel, "velSim", velSimTex);
-                    visShader.SetTexture(visVelKernel, "velVis", velMagVisTex);
-                    visShader.SetTexture(visVelKernel, "colormapTex", colormapTex);
-                    visShader.Dispatch(visVelKernel, (gridRes.x + 7) / 8, (gridRes.z + 7) / 8, 1);
-                }
-                else
-                {
-                    visShader.SetTexture(visVelDefaultColormapKernel, "velSim", velSimTex);
-                    visShader.SetTexture(visVelDefaultColormapKernel, "velVis", velMagVisTex);
-                    visShader.Dispatch(visVelDefaultColormapKernel, (gridRes.x + 7) / 8, (gridRes.z + 7) / 8, 1);
-                }
-            }
-            else if (cf.gridType == GridType.Staggered)
-            {
-                visShader.SetTexture(visVelStagKernel, "velSim", velSimTex);
-                visShader.SetTexture(visVelStagKernel, "velVis", velMagVisTex);
-                visShader.Dispatch(visVelStagKernel, (gridRes.x + 7) / 8, (gridRes.z + 7) / 8, 1);
+                visShader.SetTexture(visVelKernel, "velSim", velSimTex);
+                visShader.SetTexture(visVelKernel, "velVis", velMagVisTex);
+                visShader.SetTexture(visVelKernel, "colormapTex", colormapTex);
+                visShader.Dispatch(visVelKernel, (gridRes.x + 7) / 8, (gridRes.z + 7) / 8, 1);
             }
             else
             {
-                throw new NotImplementedException("Unsupported grid type for velocity field visualization.");
+                visShader.SetTexture(visVelDefaultColormapKernel, "velSim", velSimTex);
+                visShader.SetTexture(visVelDefaultColormapKernel, "velVis", velMagVisTex);
+                visShader.Dispatch(visVelDefaultColormapKernel, (gridRes.x + 7) / 8, (gridRes.z + 7) / 8, 1);
             }
         }
         if (cf.showPressureField == true)
@@ -453,7 +496,9 @@ public class VisualizerGpu : IVisualizer
 
     public void UpdateQuadPosBySlider(float handlePos)
     {
-        float quadPhysPosY = (physFieldPosVis.y - physDomainSizeVis.y / 2.0f) + handlePos * physDomainSizeVis.y;
+        float quadPhysPosY = physFieldPosVis.y + handlePos * physDomainSizeVis.y;
+
+        //UnityEngine.Debug.Log($"handlePos: {handlePos}, quadPhysPosY: {quadPhysPosY}");
 
         if (cf.showVelocityField == true)
         {
@@ -470,13 +515,14 @@ public class VisualizerGpu : IVisualizer
             flagQuad.transform.position = new Vector3(oldFlagQuadPos.x, quadPhysPosY, oldFlagQuadPos.z);
         }
 
-        if (cf.visualizeMode == VisualizeMode.Copy)
+        if (cf.visualizeMode == VisualizeMode.Copy || cf.showVfx == true)
         {
             ySliceRunTime = Mathf.RoundToInt(handlePos * gridRes.y);
             Mathf.Clamp(ySliceRunTime, 0, gridRes.y - 1);
             visShader.SetInt("ySlice", ySliceRunTime);
         }
-        else
+        
+        if (cf.visualizeMode == VisualizeMode.ZeroCopy)
         {
             if (cf.showVelocityField == true)
                 velMaterial.SetFloat("_YSlice", handlePos);
@@ -489,7 +535,7 @@ public class VisualizerGpu : IVisualizer
 
     public void UpdateQuadPosByConfig()
     {
-        physFieldPosVis = cf.physFieldPos * cf.visScale;
+        physFieldPosVis = rcf.physFieldPos * cf.visScale;
         float3 quadPhysPos = physFieldPosVis;
         quadPhysPos.y = (physFieldPosVis.y - physDomainSizeVis.y / 2.0f) + ySliceRunTime * dx;
 
@@ -527,7 +573,7 @@ public class VisualizerGpu : IVisualizer
 
     public void UpdateQuadSizeByConfig()
     {
-        physDomainSizeVis = cf.physDomainSize * cf.visScale;
+        physDomainSizeVis = rcf.physDomainSize * cf.visScale;
 
         if (cf.showVelocityField == true)
         {
@@ -543,6 +589,42 @@ public class VisualizerGpu : IVisualizer
         }
     }
 
+    public void AddNonUnifLayers(FluidSimConfig cfIn, RuntimeConfig rcfIn)
+    {
+        // Load configuration file and initialize simulation parameters.
+        LoadConfig(cfIn, rcfIn);
+
+        // ----- Malloc all textures -----
+        MallocSliceTex();
+        MallocVfxTex();
+        MallocColorMapTex();
+
+        MallocXYZMapTex();
+
+        //physFieldPosVis += new float3(0.5f * rcf.physDomainSize.x - rcf.unifRegionPhysStartOffset.x - 0.5f * rcf.unifRegionPhysDomainSize.x, 0, 0);
+
+        // Pressure field visualization.
+        if (cf.showVelocityField == true)
+        {
+            InitVelQuad();
+        }
+        if (cf.showPressureField == true)
+        {
+            InitPresQuad();
+        }
+        if (cf.showFlagField == true)
+        {
+            InitFlagQuad();
+        }
+
+        // Find the compute shader kernels.
+        ComputeShader visShaderAsset = Resources.Load<ComputeShader>("Shaders/VisShaders/VisShader");
+        visShader = UnityEngine.Object.Instantiate(visShaderAsset);
+
+        SetSimShaderParameters();
+        RegisterKernels();
+    }
+
     public RenderTexture GetVelDirSliceTex()
     {
         return velDirSliceTex;
@@ -551,5 +633,77 @@ public class VisualizerGpu : IVisualizer
     public RenderTexture GetVelMagSliceTex()
     {
         return velMagVisTex;
+    }
+
+    void FillLUT(Texture2D lut, float[] facePosArrayNorm)
+    {
+        // ----- The LUT array on CPU -----
+        float[] lutArray = new float[xyzMapTexSize];
+
+        // ----- The face index used in the last LUT pixel query -----
+        int jLast = 0;
+
+        // ----- For each LUT pixel -----
+        for (int i = 0; i < xyzMapTexSize; i++)
+        {
+            float physical_uv = (float)i / (xyzMapTexSize - 1);
+
+            int cellIdx = 0;
+            for (int j = jLast; j < facePosArrayNorm.Length - 1; j++)
+            {
+                if (physical_uv >= facePosArrayNorm[j] && physical_uv <= facePosArrayNorm[j + 1])
+                {
+                    jLast = j;
+                    cellIdx = j;
+                    break;
+                }
+            }
+            
+            lutArray[i] = (cellIdx + 0.5f) / (facePosArrayNorm.Length - 1);
+        }
+
+        lut.SetPixelData(lutArray, 0);
+
+        lut.Apply();
+    }
+
+    public void SetFacePosArrays(float[] facePosXArrayIn, float[] facePosYArrayIn, float[] facePosZArrayIn)
+    {
+        // ----- Face pos x array -----
+        facePosXArray = facePosXArrayIn;
+
+        // Normalize the face position array to [0, 1]
+        float[] facePosXArrayNorm = new float[facePosXArray.Length];
+        for (int i = 0; i < facePosXArray.Length; i++)
+            facePosXArrayNorm[i] = facePosXArray[i] / facePosXArray[^1];
+
+        FillLUT(xMapTex, facePosXArrayNorm);
+
+        // ----- Face pos y array -----
+        facePosYArray = facePosYArrayIn;
+
+        // Normalize the face position array to [0, 1]
+        float[] facePosYArrayNorm = new float[facePosYArray.Length];
+        for (int i = 0; i < facePosYArray.Length; i++)
+            facePosYArrayNorm[i] = facePosYArray[i] / facePosYArray[^1];
+
+        FillLUT(yMapTex, facePosYArrayNorm);
+
+        // ----- Face pos z array -----
+        facePosZArray = facePosZArrayIn;
+
+        // Normalize the face position array to [0, 1]
+        float[] facePosZArrayNorm = new float[facePosZArray.Length];
+        for (int i = 0; i < facePosZArray.Length; i++)
+            facePosZArrayNorm[i] = facePosZArray[i] / facePosZArray[^1];
+
+        FillLUT(zMapTex, facePosZArrayNorm);
+    }
+
+    public void SetTextures(RenderTexture velSimTexIn, RenderTexture presSimTexIn, RenderTexture flagSimTexIn)
+    {
+        velSimTex = velSimTexIn;
+        presSimTex = presSimTexIn;
+        flagSimTex = flagSimTexIn;
     }
 }

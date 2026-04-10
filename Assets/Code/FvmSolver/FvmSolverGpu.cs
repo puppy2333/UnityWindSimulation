@@ -27,8 +27,6 @@ public class FvmSolverGpu : IFvmSolver
 
     // Fluid simulation parameters, will be derived from user-defined parameters.
     private int3 gridRes;
-    private int3 presRes;
-    private int3 velRes;
     #endregion
 
     #region Shaders
@@ -53,7 +51,7 @@ public class FvmSolverGpu : IFvmSolver
 
     // Velocity flux at cell faces, used in Rhie-Chow interpolation (currently only implemented in
     // non-uniform grids).
-    private RenderTexture velFaceFluxFieldTex;
+    private RenderTexture massFluxFieldTex;
 
     // ----- Flag textures -----
     private RenderTexture flagTex;
@@ -91,6 +89,11 @@ public class FvmSolverGpu : IFvmSolver
     private ComputeBuffer gloResBuf;
     private float[] gloResBufCpu;
 
+    // For calculating CFL.
+    int gloCflBufSize;
+    private ComputeBuffer gloCflBuf;
+    private float[] gloCflBufCpu;
+
     // ----- Boundary condition textures -----
     private RenderTexture bndX0Tex;
     private RenderTexture bndXnTex;
@@ -126,8 +129,6 @@ public class FvmSolverGpu : IFvmSolver
     int initFaceEddyVisFieldKernel;
 
     // ----- SIMPLE kernels -----
-    int computePredictedVelKernel;
-    int solvePresCorrectionKernel;
     int neumannPresBndCondKernel;
     int applyPresCorrectionKernel;
     int presNormalizationKernel;
@@ -153,6 +154,7 @@ public class FvmSolverGpu : IFvmSolver
     // ----- Residual calculation kernels -----
     int computeVelPredictResidualKernel;
     int computePresCorrectResidualKernel;
+    int calCflKernel;
 
     // ----- Utility shader kernel -----
     int copyVelFieldKernel;
@@ -163,6 +165,7 @@ public class FvmSolverGpu : IFvmSolver
     CurrSolverStage currSolverStage = CurrSolverStage.Idle;
     int currItersInCurrSim = 0;
     bool readyForRender = true;
+    float maxCfl = 0f;
     #endregion
 
     #region StopWatch
@@ -173,63 +176,68 @@ public class FvmSolverGpu : IFvmSolver
     public FvmSolverGpu(FluidSimConfig cfIn, RuntimeConfig rcfIn)
     {
         // Load from configuration file.
-        LoadConfig(cfIn);
-        rcf = rcfIn;
+        LoadConfig(cfIn, rcfIn);
 
-        // Malloc the velocity and pressure textures.
-        MallocTextures();
-
-        // Initialize shaders and kernels.
-        InitInitShader();
-        
-        if (cf.gridType == GridType.Collocated || cf.gridType == GridType.Staggered)
-            InitFvmShader();
-        else if (cf.gridType == GridType.CollNonUniform)
-            InitFvmNonUniformShader();
-
-        InitUtilsShader();
-        if (cf.fvmSolverType == FvmSolverType.PISO)
-            InitPisoShader();
-        if (cf.turbulenceModel == TurbulenceModel.Smagorinsky)
+        if (cf.grid is not NonUniformGridAuto)
         {
-            InitLESShader();
-            InitWallFuncShader();
+            // Malloc the velocity and pressure textures.
+            MallocTextures();
+
+            // Initialize shaders and kernels.
+            InitInitShader();
+
+            if (cf.grid is UniformGrid)
+                InitFvmShader();
+            else if (cf.grid is NonUniformGridAuto or NonUniformGridDefault)
+                InitFvmNonUniformShader();
+
+            InitUtilsShader();
+            if (cf.fvmSolverType == FvmSolverType.PISO)
+                InitPisoShader();
+            if (cf.turbulenceModel == TurbulenceModel.Smagorinsky)
+            {
+                InitLESShader();
+                InitWallFuncShader();
+            }
+
+            // Print grid information.
+            UnityEngine.Debug.Log($"Grid Resolution: {gridRes.x} x {gridRes.y} x {gridRes.z}");
+            UnityEngine.Debug.Log($"CFL condition (should be less than 1): {cf.velX0.x * cf.dt / rcf.dxUnif}");
+
+            // Init mesh.
+            if (cf.grid is NonUniformGridDefault)
+                GenNonUnifMesh();
+
+            // Init flag field.
+            InitFlagField();
+
+            // Init pressure and velocity fields (vel field must be inited after flag field).
+            InitVelPresFields();
+
+            if (cf.turbulenceModel == TurbulenceModel.Smagorinsky)
+                InitFaceEddyVisField();
+
+            if (cf.solidType == SolidType.Box)
+            {
+                if (cf.grid is NonUniformGridAuto or NonUniformGridDefault)
+                    CalcBoxPos();
+                InitBox();
+            }
+
+            // ----- Set boundary conditions -----
+            SetZeroVelBndCond();
+            SetFixedValueVelBndCond();
         }
-
-        // Print grid information.
-        UnityEngine.Debug.Log($"Grid Resolution: {gridRes.x} x {gridRes.y} x {gridRes.z}");
-        UnityEngine.Debug.Log($"CFL condition (should be less than 1): {cf.Umax * cf.dt / cf.dx}");
-
-        // Init mesh.
-        if (cf.gridType == GridType.CollNonUniform)
-            InitMeshBuffers();
-
-        // Init flag field.
-        InitFlagField();
-
-        // Init pressure and velocity fields (vel field must be inited after flag field).
-        InitVelPresFields();
-
-        if (cf.turbulenceModel == TurbulenceModel.Smagorinsky)
-            InitFaceEddyVisField();
-
-        if (cf.solidType == SolidType.Box)
-            InitBox();
-
-        // ----- Set boundary conditions -----
-        SetZeroVelBndCond();
-        SetFixedValueVelBndCond();
     }
 
-    void LoadConfig(FluidSimConfig cfIn)
+    void LoadConfig(FluidSimConfig cfIn, RuntimeConfig rcfIn)
     {
         // Load configuration file.
         cf = cfIn;
+        rcf = rcfIn;
         externalForce = new(cf.externalForce.x, cf.externalForce.y, cf.externalForce.z);
 
-        gridRes = cf.gridRes;
-        presRes = cf.presRes;
-        velRes = cf.velRes;
+        gridRes = rcf.numCells;
 
         numGroups = new int3((gridRes.x + 7) / 8, (gridRes.y + 7) / 8, (gridRes.z + 7) / 8);
     }
@@ -263,33 +271,39 @@ public class FvmSolverGpu : IFvmSolver
     void MallocTextures()
     {
         // ----- SIMPLE textures -----
-        velFieldTex = CreateRenderTexture3D(velRes, RenderTextureFormat.ARGBFloat);
-        velFieldLastTimeTex = CreateRenderTexture3D(velRes, RenderTextureFormat.ARGBFloat);
-        velFieldLastIterTex = CreateRenderTexture3D(velRes, RenderTextureFormat.ARGBFloat);
-        velCorrectFieldTex = CreateRenderTexture3D(velRes, RenderTextureFormat.ARGBFloat);
+        velFieldTex = CreateRenderTexture3D(gridRes, RenderTextureFormat.ARGBFloat);
+        velFieldLastTimeTex = CreateRenderTexture3D(gridRes, RenderTextureFormat.ARGBFloat);
+        velFieldLastIterTex = CreateRenderTexture3D(gridRes, RenderTextureFormat.ARGBFloat);
+        velCorrectFieldTex = CreateRenderTexture3D(gridRes, RenderTextureFormat.ARGBFloat);
 
-        presFieldLastTimeTex = CreateRenderTexture3D(presRes, RenderTextureFormat.RFloat);
-        presCorrectFieldTex = CreateRenderTexture3D(presRes, RenderTextureFormat.RFloat);
-        presCorrectFieldLastIterTex = CreateRenderTexture3D(presRes, RenderTextureFormat.RFloat);
+        presFieldLastTimeTex = CreateRenderTexture3D(gridRes, RenderTextureFormat.RFloat);
+        presCorrectFieldTex = CreateRenderTexture3D(gridRes, RenderTextureFormat.RFloat);
+        presCorrectFieldLastIterTex = CreateRenderTexture3D(gridRes, RenderTextureFormat.RFloat);
 
-        velFaceFluxFieldTex = CreateRenderTexture3D(velRes + new int3(1, 1, 1), RenderTextureFormat.ARGBFloat);
+        massFluxFieldTex = CreateRenderTexture3D(gridRes + new int3(1, 1, 1), RenderTextureFormat.ARGBFloat);
 
         flagTex = CreateRenderTexture3D(gridRes, RenderTextureFormat.RInt);
 
-        DFieldTex = CreateRenderTexture3D(velRes, RenderTextureFormat.ARGBFloat);
-        bFieldTex = CreateRenderTexture3D(velRes, RenderTextureFormat.ARGBFloat);
-        DFieldPresCorrectTex = CreateRenderTexture3D(presRes, RenderTextureFormat.RFloat);
-        bFieldPresCorrectTex = CreateRenderTexture3D(presRes, RenderTextureFormat.RFloat);
+        DFieldTex = CreateRenderTexture3D(gridRes, RenderTextureFormat.ARGBFloat);
+        bFieldTex = CreateRenderTexture3D(gridRes, RenderTextureFormat.ARGBFloat);
+        DFieldPresCorrectTex = CreateRenderTexture3D(gridRes, RenderTextureFormat.RFloat);
+        bFieldPresCorrectTex = CreateRenderTexture3D(gridRes, RenderTextureFormat.RFloat);
 
         // ----- PISO Texturees -----
         if (cf.fvmSolverType == FvmSolverType.PISO)
-            AodUCorrectFieldTex = CreateRenderTexture3D(velRes, RenderTextureFormat.ARGBFloat);
+            AodUCorrectFieldTex = CreateRenderTexture3D(gridRes, RenderTextureFormat.ARGBFloat);
 
         // ----- Residual textures -----
         gloResBufSize = numGroups.x * numGroups.y * numGroups.z;
         gloResBufCpu = new float[gloResBufSize];
         gloResBuf = new ComputeBuffer(gloResBufSize, sizeof(float));
         gloResBuf.SetData(gloResBufCpu);
+
+        // ----- CFL textures -----
+        gloCflBufSize = numGroups.x * numGroups.y * numGroups.z;
+        gloCflBufCpu = new float[gloCflBufSize];
+        gloCflBuf = new ComputeBuffer(gloCflBufSize, sizeof(float));
+        gloCflBuf.SetData(gloCflBufCpu);
 
         // ----- Boundary textures -----
         bndX0Tex = CreateRenderTexture2D(new int2(gridRes.y, gridRes.z), RenderTextureFormat.ARGBFloat);
@@ -312,34 +326,32 @@ public class FvmSolverGpu : IFvmSolver
 
         // ----- Set shader parameters (general) -----
         initShader.SetInts("gridRes", gridRes.x, gridRes.y, gridRes.z);
-        initShader.SetInts("R", cf.R.x, cf.R.y);
-        initShader.SetInts("jetCenter", cf.jetCenter.x, cf.jetCenter.y);
 
         // ----- Set shader parameters (bnd conds) -----
         initShader.SetFloats("velX0", rcf.windSpeed, 0, 0);
         initShader.SetFloats("velZn", cf.velZn.x, cf.velZn.y, cf.velZn.z);
 
         // ----- Set shader parameters (solid) -----
-        initShader.SetFloats("boxStart", cf.boxStart.x, cf.boxStart.y, cf.boxStart.z);
-        initShader.SetFloats("boxEnd", cf.boxEnd.x, cf.boxEnd.y, cf.boxEnd.z);
+        initShader.SetInts("boxStartIdx", cf.boxStartIdx.x, cf.boxStartIdx.y, cf.boxStartIdx.z);
+        initShader.SetInts("boxEndIdx", cf.boxEndIdx.x, cf.boxEndIdx.y, cf.boxEndIdx.z);
 
         // ----- Set shader parameters (fluid field) -----
         initShader.SetFloats("internalVelField", rcf.windSpeed, 0, 0);
 
         // ----- Register kernels (fluid field) -----
         initVelPresFieldsKernel = initShader.FindKernel("CSInitVelPresFields");
-        if (cf.gridType == GridType.Collocated)
+        if (cf.grid is UniformGrid)
             initLogVelPresFieldsKernel = initShader.FindKernel("CSInitLogVelPresFields");
-        else if (cf.gridType == GridType.CollNonUniform)
+        else if (cf.grid is NonUniformGridAuto or NonUniformGridDefault)
             initLogVelPresFieldsKernel = initShader.FindKernel("CSInitLogVelPresFieldsNonUniform");
         initVelPresFieldsFromBGFlowKernel = initShader.FindKernel("CSInitVelPresFieldsFromBGFlowRotate");
 
         // ----- Register kernels (bnd conds) -----
         setZeroVelBndCondKernel = initShader.FindKernel("CSSetZeroVelBndCond");
         setFixedValueVelBndCondKernel = initShader.FindKernel("CSSetFixedValueVelBndCond");
-        if (cf.gridType == GridType.Collocated)
+        if (cf.grid is UniformGrid)
             setLogVelBndCondKernel = initShader.FindKernel("CSSetLogVelBndCond");
-        else if (cf.gridType == GridType.CollNonUniform)
+        else if (cf.grid is NonUniformGridAuto or NonUniformGridDefault)
             setLogVelBndCondKernel = initShader.FindKernel("CSSetLogVelBndCondNonUniform");
 
         // ----- Register kernels (flag field) -----
@@ -352,14 +364,10 @@ public class FvmSolverGpu : IFvmSolver
     void InitFvmShader()
     {
         // Load shader file.
-        if (cf.gridType == GridType.Collocated)
+        if (cf.grid is UniformGrid)
         {
             ComputeShader fvmShaderAsset = Resources.Load<ComputeShader>("Shaders/SimShaders/FvmColl");
             fvmShader = UnityEngine.Object.Instantiate(fvmShaderAsset);
-        }
-        else if (cf.gridType == GridType.Staggered)
-        {
-            fvmShader = Resources.Load<ComputeShader>("Shaders/SimShaders/FvmStag");
         }
         else
         {
@@ -368,12 +376,10 @@ public class FvmSolverGpu : IFvmSolver
 
         // Set shader parameters.
         fvmShader.SetInts("gridRes", gridRes.x, gridRes.y, gridRes.z);
-        fvmShader.SetInts("presRes", presRes.x, presRes.y, presRes.z);
-        fvmShader.SetInts("velRes", velRes.x, velRes.y, velRes.z);
         fvmShader.SetFloat("dt", cf.dt);
-        fvmShader.SetFloat("dx", cf.dx);
-        fvmShader.SetFloat("ds", cf.ds);
-        fvmShader.SetFloat("dv", cf.dv);
+        fvmShader.SetFloat("dx", rcf.dxUnif);
+        fvmShader.SetFloat("ds", rcf.dsUnif);
+        fvmShader.SetFloat("dv", rcf.dvUnif);
         fvmShader.SetFloat("nu", cf.nu);
         fvmShader.SetFloat("den", cf.den);
         fvmShader.SetVector("externalForce", externalForce);
@@ -396,25 +402,23 @@ public class FvmSolverGpu : IFvmSolver
         fvmShader.SetInt("presBndTypeZn", (int)cf.presBndCondZn);
 
         // Register kernels.
-        if (cf.gridType == GridType.Collocated)
+        if (cf.grid is UniformGrid)
         {
-            // ----- SIMPLE kernels -----
-            if (cf.turbulenceModel == TurbulenceModel.Smagorinsky)
-                computePredictedVelKernel = fvmShader.FindKernel("CSComputePredictedVelLES");
-            else
-                computePredictedVelKernel = fvmShader.FindKernel("CSComputePredictedVel");
-
-            if (cf.faceVelInterpScheme == FaceVelInterpScheme.RhieChow)
-                solvePresCorrectionKernel = fvmShader.FindKernel("CSSolvePresCorrectionRhieChow");
-            else
-                solvePresCorrectionKernel = fvmShader.FindKernel("CSSolvePresCorrection");
-
-            // ----- SIMPLE kernels (accelerated) -----
-            velPredictPreComputeKernel = fvmShader.FindKernel("CSVelPredictPreCompute");
-            velPredictKernel = fvmShader.FindKernel("CSVelPredict");
+            // ----- SIMPLE kernels (vel predict) -----
+            if (cf.convectScheme == ConvectScheme.CDS)
+            {
+                velPredictPreComputeKernel = fvmShader.FindKernel("CSVelPredictPreCompute");
+                velPredictKernel = fvmShader.FindKernel("CSVelPredict");
+            }
+            else if (cf.convectScheme == ConvectScheme.LUST)
+            {
+                velPredictPreComputeKernel = fvmShader.FindKernel("CSVelPredictLUSTPreCompute");
+                velPredictKernel = fvmShader.FindKernel("CSVelPredictLUST");
+            }
+            // ----- SIMPLE kernels (pres correct) -----
             presCorrectPreComputeKernel = fvmShader.FindKernel("CSPresCorrectRhieChowPreCompute");
             presCorrectKernel = fvmShader.FindKernel("CSPresCorrectRhieChow");
-
+            // ----- SIMPLE kernels (apply correction) -----
             applyPresCorrectionKernel = fvmShader.FindKernel("CSApplyPresCorrection");
             presNormalizationKernel = fvmShader.FindKernel("CSPresNormalization");
             //applyVelCorrectionKernel = fvmShader.FindKernel("CSApplyVelCorrection");
@@ -423,22 +427,13 @@ public class FvmSolverGpu : IFvmSolver
             // ----- Tolerence kernels -----
             computeVelPredictResidualKernel = fvmShader.FindKernel("CSComputeVelPredictResidual");
             computePresCorrectResidualKernel = fvmShader.FindKernel("CSComputePresCorrectResidual");
+            
+            // ----- CFL kernel -----
+            calCflKernel = fvmShader.FindKernel("CSCalCfl");
         }
         else
         {
-            if (cf.convectionScheme == ConvectionScheme.CDS)
-            {
-                computePredictedVelKernel = fvmShader.FindKernel("CSComputePredictedVel");
-            }
-            else
-            {
-                computePredictedVelKernel = fvmShader.FindKernel("CSComputePredictedVelUpwind");
-            }
-            solvePresCorrectionKernel = fvmShader.FindKernel("CSSolvePresCorrection");
-            neumannPresBndCondKernel = fvmShader.FindKernel("CSNeumannPresBndCond");
-            applyPresCorrectionKernel = fvmShader.FindKernel("CSApplyPresCorrection");
-            presNormalizationKernel = fvmShader.FindKernel("CSPresNormalization");
-            applyVelCorrectionKernel = fvmShader.FindKernel("CSApplyVelCorrection");
+            throw new NotImplementedException("No FVM shader implemented for current grid type.");
         }
     }
 
@@ -446,6 +441,7 @@ public class FvmSolverGpu : IFvmSolver
     {
         // Load shader file.
         ComputeShader fvmShaderAsset = Resources.Load<ComputeShader>("Shaders/SimShaders/FvmCollNonUniform");
+        //ComputeShader fvmShaderAsset = Resources.Load<ComputeShader>("Shaders/SimShaders/FvmColl2");
         fvmShader = UnityEngine.Object.Instantiate(fvmShaderAsset);
 
         // Set shader parameters.
@@ -473,8 +469,16 @@ public class FvmSolverGpu : IFvmSolver
 
         // Register kernels.
         // ----- SIMPLE kernels (accelerated) -----
-        velPredictPreComputeKernel = fvmShader.FindKernel("CSVelPredictPreCompute");
-        velPredictKernel = fvmShader.FindKernel("CSVelPredict");
+        if (cf.convectScheme == ConvectScheme.CDS)
+        {
+            velPredictPreComputeKernel = fvmShader.FindKernel("CSVelPredictPreCompute");
+            velPredictKernel = fvmShader.FindKernel("CSVelPredict");
+        }
+        else if (cf.convectScheme == ConvectScheme.LUST)
+        {
+            velPredictPreComputeKernel = fvmShader.FindKernel("CSVelPredictLUSTPreCompute");
+            velPredictKernel = fvmShader.FindKernel("CSVelPredictLUST");
+        }
         presCorrectPreComputeKernel = fvmShader.FindKernel("CSPresCorrectRhieChowPreCompute");
         presCorrectKernel = fvmShader.FindKernel("CSPresCorrectRhieChow");
 
@@ -485,12 +489,15 @@ public class FvmSolverGpu : IFvmSolver
         // ----- Tolerence kernels -----
         computeVelPredictResidualKernel = fvmShader.FindKernel("CSComputeVelPredictResidual");
         computePresCorrectResidualKernel = fvmShader.FindKernel("CSComputePresCorrectResidual");
+
+        // ---- CFL kernel -----
+        calCflKernel = fvmShader.FindKernel("CSCalCfl");
     }
 
     void InitPisoShader()
     {
         // Load shader file.
-        if (cf.gridType == GridType.Collocated)
+        if (cf.grid is UniformGrid)
             pisoShader = Resources.Load<ComputeShader>("Shaders/SimShaders/PisoColl");
         else
             throw new NotImplementedException("No Piso algorithm implemented for staggered grid.");
@@ -498,15 +505,15 @@ public class FvmSolverGpu : IFvmSolver
         // Set shader parameters.
         pisoShader.SetInts("gridRes", gridRes.x, gridRes.y, gridRes.z);
         pisoShader.SetFloat("dt", cf.dt);
-        pisoShader.SetFloat("dx", cf.dx);
-        pisoShader.SetFloat("ds", cf.ds);
-        pisoShader.SetFloat("dv", cf.dv);
+        pisoShader.SetFloat("dx", rcf.dxUnif);
+        pisoShader.SetFloat("ds", rcf.dsUnif);
+        pisoShader.SetFloat("dv", rcf.dvUnif);
         pisoShader.SetFloat("nu", cf.nu);
         pisoShader.SetFloat("den", cf.den);
         pisoShader.SetVector("externalForce", externalForce);
 
         // Register kernels.
-        if (cf.gridType == GridType.Collocated)
+        if (cf.grid is UniformGrid)
         {
             pisoCalAodUCorrectKernel = pisoShader.FindKernel("CSPisoCalAodUCorrect");
             pisoPresCorrectionKernel = pisoShader.FindKernel("CSPisoPresCorrection");
@@ -521,14 +528,22 @@ public class FvmSolverGpu : IFvmSolver
 
     void InitLESShader()
     {
-        // Load shader file.
-        ComputeShader lesShaderAsset = Resources.Load<ComputeShader>("Shaders/LESShaders/Les");
-        lesShader = UnityEngine.Object.Instantiate(lesShaderAsset);
+        if (cf.grid is UniformGrid)
+        {
+            ComputeShader lesShaderAsset = Resources.Load<ComputeShader>("Shaders/LESShaders/Les");
+            lesShader = UnityEngine.Object.Instantiate(lesShaderAsset);
+
+            lesShader.SetFloat("dx", rcf.dxUnif);
+            lesShader.SetFloat("ds", rcf.dsUnif);
+        }
+        else if (cf.grid is NonUniformGridAuto or NonUniformGridDefault)
+        {
+            ComputeShader lesShaderAsset = Resources.Load<ComputeShader>("Shaders/LESShaders/LesNonUniform");
+            lesShader = UnityEngine.Object.Instantiate(lesShaderAsset);
+        }
 
         // Set shader parameters.
         lesShader.SetInts("gridRes", gridRes.x, gridRes.y, gridRes.z);
-        lesShader.SetFloat("dx", cf.dx);
-        lesShader.SetFloat("ds", cf.ds);
         lesShader.SetFloat("nu", cf.nu);
         lesShader.SetFloat("cs", cf.smagorinskyConstant);
 
@@ -553,14 +568,22 @@ public class FvmSolverGpu : IFvmSolver
 
     void InitWallFuncShader()
     {
-        // Load shader file.
-        ComputeShader wallFuncShaderAsset = Resources.Load<ComputeShader>("Shaders/WallFuncShaders/WallFunc");
-        wallFuncShader = UnityEngine.Object.Instantiate(wallFuncShaderAsset);
+        if (cf.grid is UniformGrid)
+        {
+            ComputeShader wallFuncShaderAsset = Resources.Load<ComputeShader>("Shaders/WallFuncShaders/WallFunc");
+            wallFuncShader = UnityEngine.Object.Instantiate(wallFuncShaderAsset);
+
+            wallFuncShader.SetFloat("dx", rcf.dxUnif);
+            wallFuncShader.SetFloat("ds", rcf.dsUnif);
+        }
+        else if (cf.grid is NonUniformGridAuto or NonUniformGridDefault)
+        {
+            ComputeShader wallFuncShaderAsset = Resources.Load<ComputeShader>("Shaders/WallFuncShaders/WallFuncNonUniform");
+            wallFuncShader = UnityEngine.Object.Instantiate(wallFuncShaderAsset);
+        }
 
         // Set shader parameters.
         wallFuncShader.SetInts("gridRes", gridRes.x, gridRes.y, gridRes.z);
-        wallFuncShader.SetFloat("dx", cf.dx);
-        wallFuncShader.SetFloat("ds", cf.ds);
         wallFuncShader.SetFloat("nu", cf.nu);
         wallFuncShader.SetFloat("den", cf.den);
         wallFuncShader.SetFloat("cs", cf.smagorinskyConstant);
@@ -591,17 +614,16 @@ public class FvmSolverGpu : IFvmSolver
 
         // Set shader parameters.
         utilsShader.SetInts("gridRes", gridRes.x, gridRes.y, gridRes.z);
-        utilsShader.SetInts("presRes", presRes.x, presRes.y, presRes.z);
-        utilsShader.SetInts("velRes", velRes.x, velRes.y, velRes.z);
 
         // Register kernels.
         copyVelFieldKernel = utilsShader.FindKernel("CSCopyVelField");
         setPresFieldKernel = utilsShader.FindKernel("CSSetPresField");
     }
 
-    void InitMeshBuffersTest()
+    void GenNonUnifMesh()
     {
-        facePosXBuf = new ComputeBuffer(gridRes.x + 1, sizeof(float)); // +1 for face positions
+        // ----- Malloc GPU buffers and CPU arrays, +1 for face positions -----
+        facePosXBuf = new ComputeBuffer(gridRes.x + 1, sizeof(float));
         facePosYBuf = new ComputeBuffer(gridRes.y + 1, sizeof(float));
         facePosZBuf = new ComputeBuffer(gridRes.z + 1, sizeof(float));
 
@@ -609,151 +631,69 @@ public class FvmSolverGpu : IFvmSolver
         facePosYArray = new float[gridRes.y + 1];
         facePosZArray = new float[gridRes.z + 1];
 
-        // ----- Uniform grid -----
-        //for (int x = 0; x < gridRes.x + 1; x++)
-        //    facePosXArray[x] = x * cf.dx;
-        //for (int y = 0; y < gridRes.y + 1; y++)
-        //    facePosYArray[y] = y * cf.dx;
-        //for (int z = 0; z < gridRes.z + 1; z++)
-        //    facePosZArray[z] = z * cf.dx;
+        UnityEngine.Debug.Log($"Non-uniform region 0 num cells: {rcf.nonUnifRegion0NumCells}");
+        UnityEngine.Debug.Log($"Uniform region num cells: {rcf.unifRegionNumCells}");
+        UnityEngine.Debug.Log($"Non-uniform region N num cells: {rcf.nonUnifRegionNNumCells}");
+        UnityEngine.Debug.Log($"Total num cells: {rcf.numCells}");
 
-        // ----- Non uniform grid -----
-        // Cell length array, from object to, e.g. x0 domain boundary.
-        // Pattern: [dx, 1.08 * dx, 1.08^2 * dx, ...].
-        float[] x0GridSizeArray = new float[45];
-        float[] ynGridSizeArray = new float[30];
-
-        float ratio = 1.04f;
-
-        x0GridSizeArray[0] = cf.dx;
-        //for (int i = 1; i < 45; i++)
-        //    x0GridSizeArray[i] = x0GridSizeArray[i - 1] * ratio;
-        for (int i = 1; i < 20; i++)
-            x0GridSizeArray[i] = x0GridSizeArray[i - 1] * ratio;
-        for (int i = 20; i < 45; i++)
-            x0GridSizeArray[i] = x0GridSizeArray[i - 1];
-
-        ynGridSizeArray[0] = cf.dx;
-        for (int i = 1; i < 30; i++)
-            ynGridSizeArray[i] = ynGridSizeArray[i - 1] * ratio;
-
-        // ----- Fill in the x face position arrays -----
-        facePosXArray[0] = 0;
-        for (int x = 1; x < 46; x++) // Face number = cell number + 1
-            facePosXArray[x] = facePosXArray[x - 1] + x0GridSizeArray[45 - x];
-        for (int x = 46; x < 56; x++)
-            facePosXArray[x] = facePosXArray[x - 1] + cf.dx;
-        for (int x = 56; x < gridRes.x + 1; x++)
-            facePosXArray[x] = facePosXArray[x - 1] + x0GridSizeArray[x - 56];
-
-        //for (int x = 0; x < gridRes.x + 1; x++)
-        //    facePosXArray[x] = 2 * x * cf.dx;
-
-        // ----- Fill in the y face position arrays -----
-        //for (int y = 0; y < 21; y++) // Face number = cell number + 1
-        //    facePosYArray[y] = y * cf.dx;
-        //for (int y = 21; y < 51; y++)
-        //    facePosYArray[y] = facePosYArray[y - 1] + ynGridSizeArray[y - 21];
-
-        for (int y = 0; y < gridRes.y + 1; y++)
-            facePosYArray[y] = y * cf.dx;
-
-        // ----- Fill in the z face position arrays -----
-        //facePosZArray[0] = 0;
-        //for (int z = 1; z < 46; z++) // Face number = cell number + 1
-        //    facePosZArray[z] = facePosZArray[z - 1] + x0GridSizeArray[45 - z];
-        //for (int z = 46; z < 56; z++)
-        //    facePosZArray[z] = facePosZArray[z - 1] + cf.dx;
-        //for (int z = 56; z < gridRes.z + 1; z++)
-        //    facePosZArray[z] = facePosZArray[z - 1] + x0GridSizeArray[z - 56];
-
-        for (int z = 0; z < gridRes.z + 1; z++)
-            facePosZArray[z] = z * cf.dx;
-
-        UnityEngine.Debug.Log(string.Join(", ", facePosXArray));
-        UnityEngine.Debug.Log(string.Join(", ", facePosYArray));
-        UnityEngine.Debug.Log(string.Join(", ", facePosZArray));
-
-        facePosXBuf.SetData(facePosXArray);
-        facePosYBuf.SetData(facePosYArray);
-        facePosZBuf.SetData(facePosZArray);
-    }
-
-    void InitMeshBuffers()
-    {
-        facePosXBuf = new ComputeBuffer(gridRes.x + 1, sizeof(float)); // +1 for face positions
-        facePosYBuf = new ComputeBuffer(gridRes.y + 1, sizeof(float));
-        facePosZBuf = new ComputeBuffer(gridRes.z + 1, sizeof(float));
-
-        facePosXArray = new float[gridRes.x + 1];
-        facePosYArray = new float[gridRes.y + 1];
-        facePosZArray = new float[gridRes.z + 1];
-
-        int3 uniformSize = new int3(50, 50, 50);
-        int3 numNonUniformCellsOneSide = new int3(25, 0, 25);
-        //int3 uniformSize = new int3(100, 50, 100);
-        //int3 numNonUniformCellsOneSide = new int3(0, 0, 0);
-        float ratio = 1.08f;
-
-        // ----- Non uniform grid -----
-        // Cell length array, from object to, e.g. x0 domain boundary.
-        // Pattern: [dx, 1.08 * dx, 1.08^2 * dx, ...].
-        float[] x0GridSizeArray = new float[numNonUniformCellsOneSide.x];
-        float[] xnGridSizeArray = new float[gridRes.x - uniformSize.x - numNonUniformCellsOneSide.x];
-        float[] y0GridSizeArray = new float[numNonUniformCellsOneSide.y];
-        float[] ynGridSizeArray = new float[gridRes.y - uniformSize.y - numNonUniformCellsOneSide.y];
-        float[] z0GridSizeArray = new float[numNonUniformCellsOneSide.z];
-        float[] znGridSizeArray = new float[gridRes.z - uniformSize.z - numNonUniformCellsOneSide.z];
+        // ----- Cell length array, from object to, e.g. x0 domain boundary.
+        // Pattern: [dx, 1.08 * dx, 1.08^2 * dx, ...]. -----
+        float[] x0GridSizeArray = new float[rcf.nonUnifRegion0NumCells.x];
+        float[] xnGridSizeArray = new float[rcf.nonUnifRegionNNumCells.x];
+        float[] y0GridSizeArray = new float[rcf.nonUnifRegion0NumCells.y];
+        float[] ynGridSizeArray = new float[rcf.nonUnifRegionNNumCells.y];
+        float[] z0GridSizeArray = new float[rcf.nonUnifRegion0NumCells.z];
+        float[] znGridSizeArray = new float[rcf.nonUnifRegionNNumCells.z];
 
         if (x0GridSizeArray.Length > 0)
         {
-            x0GridSizeArray[0] = cf.dx;
+            x0GridSizeArray[0] = rcf.dxUnif;
             for (int i = 1; i < x0GridSizeArray.Length; i++)
-                x0GridSizeArray[i] = x0GridSizeArray[i - 1] * ratio;
+                x0GridSizeArray[i] = x0GridSizeArray[i - 1] * rcf.stretchFactor.x;
         }
         if (xnGridSizeArray.Length > 0)
         {
-            xnGridSizeArray[0] = cf.dx;
+            xnGridSizeArray[0] = rcf.dxUnif;
             for (int i = 1; i < xnGridSizeArray.Length; i++)
-                xnGridSizeArray[i] = xnGridSizeArray[i - 1] * ratio;
+                xnGridSizeArray[i] = xnGridSizeArray[i - 1] * rcf.stretchFactor.x;
         }
         if (y0GridSizeArray.Length > 0)
         {
-            y0GridSizeArray[0] = cf.dx;
+            y0GridSizeArray[0] = rcf.dxUnif;
             for (int i = 1; i < y0GridSizeArray.Length; i++)
-                y0GridSizeArray[i] = y0GridSizeArray[i - 1] * ratio;
+                y0GridSizeArray[i] = y0GridSizeArray[i - 1] * rcf.stretchFactor.y;
         }
         if (ynGridSizeArray.Length > 0)
         {
-            ynGridSizeArray[0] = cf.dx;
+            ynGridSizeArray[0] = rcf.dxUnif;
             for (int i = 1; i < ynGridSizeArray.Length; i++)
-                ynGridSizeArray[i] = ynGridSizeArray[i - 1] * ratio;
+                ynGridSizeArray[i] = ynGridSizeArray[i - 1] * rcf.stretchFactor.y;
         }
         if (z0GridSizeArray.Length > 0)
         {
-            z0GridSizeArray[0] = cf.dx;
+            z0GridSizeArray[0] = rcf.dxUnif;
             for (int i = 1; i < z0GridSizeArray.Length; i++)
-                z0GridSizeArray[i] = z0GridSizeArray[i - 1] * ratio;
+                z0GridSizeArray[i] = z0GridSizeArray[i - 1] * rcf.stretchFactor.z;
         }
         if (znGridSizeArray.Length > 0)
         {
-            znGridSizeArray[0] = cf.dx;
+            znGridSizeArray[0] = rcf.dxUnif;
             for (int i = 1; i < znGridSizeArray.Length; i++)
-                znGridSizeArray[i] = znGridSizeArray[i - 1] * ratio;
+                znGridSizeArray[i] = znGridSizeArray[i - 1] * rcf.stretchFactor.z;
         }
 
-        // ----- Fill in x face position arrays -----
+        // ----- Fill in x face position arrays, 0 - physDomainSize.x -----
         facePosXArray[0] = 0;
         for (int x = 1; x < x0GridSizeArray.Length + 1; x++) // Face number = cell number + 1
             facePosXArray[x] = facePosXArray[x - 1] + x0GridSizeArray[x0GridSizeArray.Length - x];
 
-        for (int x = x0GridSizeArray.Length + 1; x < x0GridSizeArray.Length + uniformSize.x + 1; x++)
-            facePosXArray[x] = facePosXArray[x - 1] + cf.dx;
+        for (int x = x0GridSizeArray.Length + 1; x < x0GridSizeArray.Length + rcf.unifRegionNumCells.x + 1; x++)
+            facePosXArray[x] = facePosXArray[x - 1] + rcf.dxUnif;
 
-        for (int x = x0GridSizeArray.Length + uniformSize.x + 1; x < gridRes.x + 1; x++)
+        for (int x = x0GridSizeArray.Length + rcf.unifRegionNumCells.x + 1; x < gridRes.x + 1; x++)
         {
-            //UnityEngine.Debug.Log($"x: {x}, index in xn array: {x - (x0GridSizeArray.Length + uniformSize.x + 1)}");
-            facePosXArray[x] = facePosXArray[x - 1] + x0GridSizeArray[x - (x0GridSizeArray.Length + uniformSize.x + 1)];
+            //UnityEngine.Debug.Log($"x: {x}, index in xn array: {x - (x0GridSizeArray.Length + cf.unifRegionNumCells.x + 1)}");
+            facePosXArray[x] = facePosXArray[x - 1] + xnGridSizeArray[x - (x0GridSizeArray.Length + rcf.unifRegionNumCells.x + 1)];
         }
 
         // ----- Fill in y face position arrays -----
@@ -761,22 +701,22 @@ public class FvmSolverGpu : IFvmSolver
         for (int y = 1; y < y0GridSizeArray.Length + 1; y++) // Face number = cell number + 1
             facePosYArray[y] = facePosYArray[y - 1] + y0GridSizeArray[y0GridSizeArray.Length - y];
 
-        for (int y = y0GridSizeArray.Length + 1; y < y0GridSizeArray.Length + uniformSize.y + 1; y++)
-            facePosYArray[y] = facePosYArray[y - 1] + cf.dx;
+        for (int y = y0GridSizeArray.Length + 1; y < y0GridSizeArray.Length + rcf.unifRegionNumCells.y + 1; y++)
+            facePosYArray[y] = facePosYArray[y - 1] + rcf.dxUnif;
 
-        for (int y = y0GridSizeArray.Length + uniformSize.y + 1; y < gridRes.y + 1; y++)
-            facePosYArray[y] = facePosYArray[y - 1] + y0GridSizeArray[y - (y0GridSizeArray.Length + uniformSize.y + 1)];
+        for (int y = y0GridSizeArray.Length + rcf.unifRegionNumCells.y + 1; y < gridRes.y + 1; y++)
+            facePosYArray[y] = facePosYArray[y - 1] + ynGridSizeArray[y - (y0GridSizeArray.Length + rcf.unifRegionNumCells.y + 1)];
 
         // ----- Fill in the z face position arrays -----
         facePosZArray[0] = 0;
         for (int z = 1; z < z0GridSizeArray.Length + 1; z++) // Face number = cell number + 1
             facePosZArray[z] = facePosZArray[z - 1] + z0GridSizeArray[z0GridSizeArray.Length - z];
 
-        for (int z = z0GridSizeArray.Length + 1; z < z0GridSizeArray.Length + uniformSize.z + 1; z++)
-            facePosZArray[z] = facePosZArray[z - 1] + cf.dx;
+        for (int z = z0GridSizeArray.Length + 1; z < z0GridSizeArray.Length + rcf.unifRegionNumCells.z + 1; z++)
+            facePosZArray[z] = facePosZArray[z - 1] + rcf.dxUnif;
 
-        for (int z = z0GridSizeArray.Length + uniformSize.z + 1; z < gridRes.z + 1; z++)
-            facePosZArray[z] = facePosZArray[z - 1] + z0GridSizeArray[z - (z0GridSizeArray.Length + uniformSize.z + 1)];
+        for (int z = z0GridSizeArray.Length + rcf.unifRegionNumCells.z + 1; z < gridRes.z + 1; z++)
+            facePosZArray[z] = facePosZArray[z - 1] + znGridSizeArray[z - (z0GridSizeArray.Length + rcf.unifRegionNumCells.z + 1)];
 
         UnityEngine.Debug.Log(string.Join(", ", facePosXArray));
         UnityEngine.Debug.Log(string.Join(", ", facePosYArray));
@@ -787,9 +727,71 @@ public class FvmSolverGpu : IFvmSolver
         facePosZBuf.SetData(facePosZArray);
     }
 
+    void CalcBoxPos()
+    {
+        float delta = 1e-4f;
+
+        int3 boxStartIdx = new int3(-1, -1, -1);
+        int3 boxEndIdx = new int3(-1, -1, -1);
+
+        UnityEngine.Debug.Log($"Box physical offset: {rcf.boxStartPhysOffset}, {rcf.boxEndPhysOffset}");
+
+        for (int x = 0; x < gridRes.x; x++)
+        {
+            if (Mathf.Abs(facePosXArray[x] - rcf.boxStartPhysOffset.x) <= delta)
+            {
+                boxStartIdx.x = x;
+            }
+
+            if (Mathf.Abs(facePosXArray[x] - rcf.boxEndPhysOffset.x) <= delta)
+            {
+                boxEndIdx.x = x;
+            }
+        }
+
+        for (int y = 0; y < gridRes.y; y++)
+        {
+            if (Mathf.Abs(facePosYArray[y] - rcf.boxStartPhysOffset.y) <= delta)
+            {
+                boxStartIdx.y = y;
+            }
+
+            if (Mathf.Abs(facePosYArray[y] - rcf.boxEndPhysOffset.y) <= delta)
+            {
+                boxEndIdx.y = y;
+            }
+        }
+
+        for (int z = 0; z < gridRes.z; z++)
+        {
+            if (Mathf.Abs(facePosZArray[z] - rcf.boxStartPhysOffset.z) <= delta)
+            {
+                boxStartIdx.z = z;
+            }
+
+            if (Mathf.Abs(facePosZArray[z] - rcf.boxEndPhysOffset.z) <= delta)
+            {
+                boxEndIdx.z = z;
+            }
+        }
+
+        if (boxStartIdx.x == -1 || boxEndIdx.x == -1 || 
+            boxStartIdx.y == -1 || boxEndIdx.y == -1 || 
+            boxStartIdx.z == -1 || boxEndIdx.z == -1)
+        {
+            throw new Exception("Box start/end physical offset does not align with any face " +
+                "position, please adjust the offsets or the grid resolution.");
+        }
+
+        cf.boxStartIdx = boxStartIdx;
+        cf.boxEndIdx = boxEndIdx;
+
+        UnityEngine.Debug.Log($"Box start idx: {cf.boxStartIdx}, box end idx: {cf.boxEndIdx}");
+    }
+
     public void InitVelPresFields()
     {
-        if (cf.gridType == GridType.Collocated)
+        if (cf.grid is UniformGrid)
         {
             if (cf.inflowType == InflowType.Constant)
             {
@@ -807,13 +809,13 @@ public class FvmSolverGpu : IFvmSolver
                 initShader.SetTexture(initVelPresFieldsKernel, "flagField", flagTex);
 
                 // Init all fields to zero.
-                initShader.Dispatch(initVelPresFieldsKernel, (velRes.x + 7) / 8, (velRes.y + 7) / 8, (velRes.z + 7) / 8);
+                initShader.Dispatch(initVelPresFieldsKernel, (gridRes.x + 7) / 8, (gridRes.y + 7) / 8, (gridRes.z + 7) / 8);
             }
             else if (cf.inflowType == InflowType.Log)
             {
                 // ----- ReInit wind speed -----
                 initShader.SetFloats("internalVelField", rcf.windSpeed, 0, 0);
-                initShader.SetFloat("dx", cf.dx);
+                initShader.SetFloat("dx", rcf.dxUnif);
                 initShader.SetFloat("karmanConst", 0.4f);
                 initShader.SetFloat("roughParam", 1.0f);
                 initShader.SetFloat("refHeight", 10.0f);
@@ -829,10 +831,10 @@ public class FvmSolverGpu : IFvmSolver
                 initShader.SetTexture(initLogVelPresFieldsKernel, "flagField", flagTex);
 
                 // Init all fields to zero.
-                initShader.Dispatch(initLogVelPresFieldsKernel, (velRes.x + 7) / 8, (velRes.y + 7) / 8, (velRes.z + 7) / 8);
+                initShader.Dispatch(initLogVelPresFieldsKernel, (gridRes.x + 7) / 8, (gridRes.y + 7) / 8, (gridRes.z + 7) / 8);
             }
         }
-        else if (cf.gridType == GridType.CollNonUniform)
+        else if (cf.grid is NonUniformGridAuto or NonUniformGridDefault)
         {
             if (cf.inflowType == InflowType.Constant)
             {
@@ -850,7 +852,7 @@ public class FvmSolverGpu : IFvmSolver
                 initShader.SetTexture(initVelPresFieldsKernel, "flagField", flagTex);
 
                 // Init all fields to zero.
-                initShader.Dispatch(initVelPresFieldsKernel, (velRes.x + 7) / 8, (velRes.y + 7) / 8, (velRes.z + 7) / 8);
+                initShader.Dispatch(initVelPresFieldsKernel, (gridRes.x + 7) / 8, (gridRes.y + 7) / 8, (gridRes.z + 7) / 8);
             }
             else if (cf.inflowType == InflowType.Log)
             {
@@ -864,6 +866,7 @@ public class FvmSolverGpu : IFvmSolver
                 initShader.SetTexture(initLogVelPresFieldsKernel, "velFieldLastTime", velFieldLastTimeTex);
                 initShader.SetTexture(initLogVelPresFieldsKernel, "velFieldLastIter", velFieldLastIterTex);
                 initShader.SetTexture(initLogVelPresFieldsKernel, "velCorrectField", velCorrectFieldTex);
+                initShader.SetTexture(initLogVelPresFieldsKernel, "massFluxField", massFluxFieldTex);
                 initShader.SetTexture(initLogVelPresFieldsKernel, "presFieldLastTime", presFieldLastTimeTex);
                 initShader.SetTexture(initLogVelPresFieldsKernel, "presCorrectField", presCorrectFieldTex);
                 initShader.SetTexture(initLogVelPresFieldsKernel, "presCorrectFieldLastIter", presCorrectFieldLastIterTex);
@@ -873,21 +876,8 @@ public class FvmSolverGpu : IFvmSolver
                 initShader.SetBuffer(initLogVelPresFieldsKernel, "facePosY", facePosYBuf);
                 initShader.SetBuffer(initLogVelPresFieldsKernel, "facePosZ", facePosZBuf);
                 // Init all fields to zero.
-                initShader.Dispatch(initLogVelPresFieldsKernel, (velRes.x + 7) / 8, (velRes.y + 7) / 8, (velRes.z + 7) / 8);
+                initShader.Dispatch(initLogVelPresFieldsKernel, (gridRes.x + 7) / 8, (gridRes.y + 7) / 8, (gridRes.z + 7) / 8);
             }
-        }
-        else if (cf.gridType == GridType.Staggered)
-        {
-            initShader.SetTexture(initPresFieldKernel, "presFieldLastTime", presFieldLastTimeTex);
-            initShader.SetTexture(initPresFieldKernel, "presCorrectField", presCorrectFieldTex);
-            initShader.SetTexture(initPresFieldKernel, "presCorrectFieldLastIter", presCorrectFieldLastIterTex);
-            initShader.Dispatch(initPresFieldKernel, (presRes.x + 7) / 8, (presRes.y + 7) / 8, (presRes.z + 7) / 8);
-
-            initShader.SetTexture(initVelFieldKernel, "flagField", flagTex);
-            initShader.SetTexture(initVelFieldKernel, "velField", velFieldTex);
-            initShader.SetTexture(initVelFieldKernel, "velFieldLastTime", velFieldLastTimeTex);
-            initShader.SetTexture(initVelFieldKernel, "velFieldLastIter", velFieldLastIterTex);
-            initShader.Dispatch(initVelFieldKernel, (velRes.x + 7) / 8, (velRes.y + 7) / 8, (velRes.z + 7) / 8);
         }
         else
         {
@@ -895,17 +885,17 @@ public class FvmSolverGpu : IFvmSolver
         }
     }
 
-    public void InitVelPresFieldsFromBackGroundFlow(FluidSimConfig cfBackGround, RenderTexture velTexBackGround, RenderTexture presTexBackGround)
+    public void InitVelPresFieldsFromBackGroundFlow(FluidSimConfig cfBG, RuntimeConfig rcfBG, RenderTexture velTexBG, RenderTexture presTexBG)
     {
-        if (cf.gridType == GridType.Collocated)
+        if (cf.grid is UniformGrid)
         {
             // ----- Set shader parameters (re-init interpolation) -----
-            initShader.SetFloat("dxFG", cf.dx);
-            initShader.SetFloat("dxBG", cfBackGround.dx);
+            initShader.SetFloat("dxFG", rcf.dxUnif);
+            initShader.SetFloat("dxBG", rcfBG.dxUnif);
             initShader.SetFloats("physFieldPosFG", cf.physFieldPos.x, cf.physFieldPos.y, cf.physFieldPos.z);
-            initShader.SetFloats("physFieldPosBG", cfBackGround.physFieldPos.x, cfBackGround.physFieldPos.y, cfBackGround.physFieldPos.z);
+            initShader.SetFloats("physFieldPosBG", cfBG.physFieldPos.x, cfBG.physFieldPos.y, cfBG.physFieldPos.z);
             initShader.SetFloat("fieldRotAng", rcf.flowFieldOrientation * (float)(3.1415926 / 180));
-            initShader.SetInts("gridResBG", cfBackGround.gridRes.x, cfBackGround.gridRes.y, cfBackGround.gridRes.z);
+            initShader.SetInts("gridResBG", rcfBG.numCells.x, rcfBG.numCells.y, rcfBG.numCells.z);
 
             // Set the textures in the compute shader.
             initShader.SetTexture(initVelPresFieldsFromBGFlowKernel, "velField", velFieldTex);
@@ -917,11 +907,11 @@ public class FvmSolverGpu : IFvmSolver
             initShader.SetTexture(initVelPresFieldsFromBGFlowKernel, "presCorrectFieldLastIter", presCorrectFieldLastIterTex);
             initShader.SetTexture(initVelPresFieldsFromBGFlowKernel, "flagField", flagTex);
 
-            initShader.SetTexture(initVelPresFieldsFromBGFlowKernel, "velFieldBG", velTexBackGround);
-            initShader.SetTexture(initVelPresFieldsFromBGFlowKernel, "presFieldBG", presTexBackGround);
+            initShader.SetTexture(initVelPresFieldsFromBGFlowKernel, "velFieldBG", velTexBG);
+            initShader.SetTexture(initVelPresFieldsFromBGFlowKernel, "presFieldBG", presTexBG);
 
             // Init all fields to zero.
-            initShader.Dispatch(initVelPresFieldsFromBGFlowKernel, (velRes.x + 7) / 8, (velRes.y + 7) / 8, (velRes.z + 7) / 8);
+            initShader.Dispatch(initVelPresFieldsFromBGFlowKernel, (gridRes.x + 7) / 8, (gridRes.y + 7) / 8, (gridRes.z + 7) / 8);
         }
         else
         {
@@ -935,7 +925,7 @@ public class FvmSolverGpu : IFvmSolver
     void InitFlagField()
     {
         initShader.SetTexture(initFlagFieldKernel, "flagField", flagTex);
-        initShader.Dispatch(initFlagFieldKernel, (presRes.x + 7) / 8, (presRes.y + 7) / 8, (presRes.z + 7) / 8);
+        initShader.Dispatch(initFlagFieldKernel, (gridRes.x + 7) / 8, (gridRes.y + 7) / 8, (gridRes.z + 7) / 8);
     }
 
     void InitFaceEddyVisField()
@@ -966,7 +956,7 @@ public class FvmSolverGpu : IFvmSolver
         initShader.SetTexture(initBoxFlagKernel, "velField", velFieldTex);
         initShader.SetTexture(initBoxFlagKernel, "velFieldLastIter", velFieldLastIterTex);
         initShader.SetTexture(initBoxFlagKernel, "velFieldLastTime", velFieldLastTimeTex);
-        initShader.Dispatch(initBoxFlagKernel, (presRes.x + 7) / 8, (presRes.y + 7) / 8, (presRes.z + 7) / 8);
+        initShader.Dispatch(initBoxFlagKernel, (gridRes.x + 7) / 8, (gridRes.y + 7) / 8, (gridRes.z + 7) / 8);
     }
 
     public void InitFlags(int[] flags)
@@ -979,18 +969,112 @@ public class FvmSolverGpu : IFvmSolver
         initShader.SetTexture(initModelFlagKernel, "velField", velFieldTex);
         initShader.SetTexture(initModelFlagKernel, "velFieldLastIter", velFieldLastIterTex);
         initShader.SetTexture(initModelFlagKernel, "velFieldLastTime", velFieldLastTimeTex);
-        initShader.Dispatch(initModelFlagKernel, (presRes.x + 7) / 8, (presRes.y + 7) / 8, (presRes.z + 7) / 8);
+        initShader.Dispatch(initModelFlagKernel, (gridRes.x + 7) / 8, (gridRes.y + 7) / 8, (gridRes.z + 7) / 8);
 
         currSolverStage = CurrSolverStage.Idle;
         currItersInCurrSim = 0;
         readyForRender = false;
     }
 
+    public void InitNonUnifGridFlags(int[] flagsNonUnif)
+    {
+        flagBuffer ??= new ComputeBuffer(gridRes.x * gridRes.y * gridRes.z, sizeof(int));
+
+        //int[] flagsNonUnif = new int[gridRes.x * gridRes.y * gridRes.z];
+
+        //for (int z = 0; z < rcf.unifRegionNumCells.z; z++)
+        //    for (int y = 0; y < rcf.unifRegionNumCells.y; y++)
+        //    {
+        //        int idx1Start = (rcf.unifRegionNumCells.x * rcf.unifRegionNumCells.y) * z + rcf.unifRegionNumCells.x * y;
+
+        //        int idx2Start = (rcf.numCells.x * rcf.numCells.y) * (rcf.nonUnifRegion0NumCells.z + z) + rcf.numCells.x * (rcf.nonUnifRegion0NumCells.y + y) + rcf.nonUnifRegion0NumCells.x;
+
+        //        Array.Copy(flags, idx1Start, flagsNonUnif, idx2Start, rcf.unifRegionNumCells.x);
+        //    }
+
+        //FillNonUnifRegions(flags, flagsNonUnif);
+
+        flagBuffer.SetData(flagsNonUnif);
+
+        initShader.SetTexture(initModelFlagKernel, "flagField", flagTex);
+        initShader.SetBuffer(initModelFlagKernel, "flagFieldBuffer", flagBuffer);
+        initShader.SetTexture(initModelFlagKernel, "velField", velFieldTex);
+        initShader.SetTexture(initModelFlagKernel, "velFieldLastIter", velFieldLastIterTex);
+        initShader.SetTexture(initModelFlagKernel, "velFieldLastTime", velFieldLastTimeTex);
+        initShader.Dispatch(initModelFlagKernel, (gridRes.x + 7) / 8, (gridRes.y + 7) / 8, (gridRes.z + 7) / 8);
+
+        currSolverStage = CurrSolverStage.Idle;
+        currItersInCurrSim = 0;
+        readyForRender = false;
+    }
+
+    public void FillNonUnifRegions(int[] flags, int[] flagsNonUnif)
+    {
+        // ----- Extract the height information from flags -----
+        int smallSizeX = rcf.unifRegionNumCells.x;
+        int smallSizeY = rcf.unifRegionNumCells.y;
+        int smallSizeZ = rcf.unifRegionNumCells.z;
+
+        int bigSizeX = rcf.numCells.x;
+        int bigSizeY = rcf.numCells.y;
+        int bigSizeZ = rcf.numCells.z;
+
+        int offsetX = rcf.nonUnifRegion0NumCells.x;
+        int offsetY = rcf.nonUnifRegion0NumCells.y;
+        int offsetZ = rcf.nonUnifRegion0NumCells.z;
+
+        int[] smallHeights = new int[smallSizeX * smallSizeZ];
+
+        for (int z = 0; z < smallSizeZ; z++)
+            for (int x = 0; x < smallSizeX; x++)
+            {
+                int heightIndex = smallSizeX * z + x;
+                smallHeights[heightIndex] = 0;
+
+                for (int y = smallSizeY - 1; y >= 0; y--)
+                {
+                    int idx = (smallSizeX * smallSizeY) * z + smallSizeX * y + x;
+                    if (flags[idx] == 1)
+                    {
+                        smallHeights[heightIndex] = y;
+                        break;
+                    }
+                }
+            }
+
+        // ----- Nearest neighbor assignment -----
+        for (int z = 0; z < bigSizeZ; z++)
+        {
+            for (int x = 0; x < bigSizeX; x++)
+            {
+                bool isInsideX = (x >= offsetX && x < offsetX + smallSizeX);
+                bool isInsideZ = (z >= offsetZ && z < offsetZ + smallSizeZ);
+
+                if (!isInsideX || !isInsideZ)
+                {
+                    int nearestX = Math.Max(offsetX, Math.Min(x, offsetX + smallSizeX - 1));
+                    int nearestZ = Math.Max(offsetZ, Math.Min(z, offsetZ + smallSizeZ - 1));
+
+                    int localX = nearestX - offsetX;
+                    int localZ = nearestZ - offsetZ;
+                    int localHeightY = smallHeights[smallSizeX * localZ + localX];
+
+                    // 对大数组该 (x, z) 的整根 Y 轴柱体进行赋值：绝对高度及以下赋 1，以上赋 0
+                    for (int y = 0; y < bigSizeY; y++)
+                    {
+                        int idx = (bigSizeX * bigSizeY) * z + bigSizeX * y + x;
+                        flagsNonUnif[idx] = (y <= localHeightY) ? 1 : 0;
+                    }
+                }
+            }
+        }
+    }
+
     void SetZeroVelBndCond()
     {
-        SetBndTextures(initShader, setZeroVelBndCondKernel);
+        SetBndTex(initShader, setZeroVelBndCondKernel);
 
-        initShader.Dispatch(setZeroVelBndCondKernel, (velRes.x + 7) / 8, (velRes.y + 7) / 8, (velRes.z + 7) / 8);
+        initShader.Dispatch(setZeroVelBndCondKernel, (gridRes.x + 7) / 8, (gridRes.y + 7) / 8, (gridRes.z + 7) / 8);
     }
 
     public void SetFixedValueVelBndCond()
@@ -998,26 +1082,24 @@ public class FvmSolverGpu : IFvmSolver
         if (cf.inflowType == InflowType.Constant)
         {
             initShader.SetFloats("velX0", rcf.windSpeed, 0, 0);
-            SetBndTextures(initShader, setFixedValueVelBndCondKernel);
-            initShader.Dispatch(setFixedValueVelBndCondKernel, (velRes.x + 7) / 8, (velRes.y + 7) / 8, (velRes.z + 7) / 8);
+            SetBndTex(initShader, setFixedValueVelBndCondKernel);
+            initShader.Dispatch(setFixedValueVelBndCondKernel, (gridRes.x + 7) / 8, (gridRes.y + 7) / 8, (gridRes.z + 7) / 8);
         }
         else if (cf.inflowType == InflowType.Log)
         {
             initShader.SetFloats("velX0", rcf.windSpeed, 0, 0);
-            initShader.SetFloat("dx", cf.dx);
+            initShader.SetFloat("dx", rcf.dxUnif);
             initShader.SetFloat("karmanConst", 0.4f);
             initShader.SetFloat("roughParam", 1.0f);
             initShader.SetFloat("refHeight", 10.0f);
 
-            if (cf.gridType == GridType.CollNonUniform)
+            if (cf.grid is NonUniformGridAuto or NonUniformGridDefault)
             {
-                initShader.SetBuffer(setLogVelBndCondKernel, "facePosX", facePosXBuf);
-                initShader.SetBuffer(setLogVelBndCondKernel, "facePosY", facePosYBuf);
-                initShader.SetBuffer(setLogVelBndCondKernel, "facePosZ", facePosZBuf);
+                SetFacePosTex(initShader, setLogVelBndCondKernel);
             }
 
-            SetBndTextures(initShader, setLogVelBndCondKernel);
-            initShader.Dispatch(setLogVelBndCondKernel, (velRes.x + 7) / 8, (velRes.y + 7) / 8, (velRes.z + 7) / 8);
+            SetBndTex(initShader, setLogVelBndCondKernel);
+            initShader.Dispatch(setLogVelBndCondKernel, (gridRes.x + 7) / 8, (gridRes.y + 7) / 8, (gridRes.z + 7) / 8);
         }
     }
     #endregion
@@ -1034,15 +1116,66 @@ public class FvmSolverGpu : IFvmSolver
     public void ChangePhysDomainSize()
     {
         // ----- Reload from the configuration file -----
-        gridRes = cf.gridRes;
-        presRes = cf.presRes;
-        velRes = cf.velRes;
+        gridRes = rcf.numCells;
         numGroups = new int3((gridRes.x + 7) / 8, (gridRes.y + 7) / 8, (gridRes.z + 7) / 8);
 
         // ----- Reinitialize fields -----
 
         // Init pressure and velocity fields (vel field must be inited after flag field).
         InitVelPresFields();
+    }
+
+    public void InitNonUnifGridAuto(FluidSimConfig cfIn, RuntimeConfig rcfIn)
+    {
+        // Load from configuration file.
+        LoadConfig(cfIn, rcfIn);
+
+        // Malloc the velocity and pressure textures.
+        MallocTextures();
+
+        // Initialize shaders and kernels.
+        InitInitShader();
+
+        if (cf.grid is UniformGrid)
+            InitFvmShader();
+        else if (cf.grid is NonUniformGridAuto or NonUniformGridDefault)
+            InitFvmNonUniformShader();
+
+        InitUtilsShader();
+        if (cf.fvmSolverType == FvmSolverType.PISO)
+            InitPisoShader();
+        if (cf.turbulenceModel == TurbulenceModel.Smagorinsky)
+        {
+            InitLESShader();
+            InitWallFuncShader();
+        }
+
+        // Print grid information.
+        UnityEngine.Debug.Log($"Grid Resolution: {gridRes.x} x {gridRes.y} x {gridRes.z}");
+        UnityEngine.Debug.Log($"CFL condition (should be less than 1): {cf.velX0.x * cf.dt / rcf.dxUnif}");
+
+        // Init mesh.
+        GenNonUnifMesh();
+
+        // Init flag field.
+        InitFlagField();
+
+        // Init pressure and velocity fields (vel field must be inited after flag field).
+        InitVelPresFields();
+
+        if (cf.turbulenceModel == TurbulenceModel.Smagorinsky)
+            InitFaceEddyVisField();
+
+        if (cf.solidType == SolidType.Box)
+        {
+            if (cf.grid is NonUniformGridAuto or NonUniformGridDefault)
+                CalcBoxPos();
+            InitBox();
+        }
+
+        // ----- Set boundary conditions -----
+        SetZeroVelBndCond();
+        SetFixedValueVelBndCond();
     }
     #endregion
 
@@ -1100,8 +1233,14 @@ public class FvmSolverGpu : IFvmSolver
             }
         }
 
+        // ----- Post-processing -----
         if (currSolverStage == CurrSolverStage.Finished)
         {
+            if (cf.calMaxCfl && cf.currSimStep % 10 == 0)
+            {
+                _ComputeMaxCfl();
+            }
+
             (velFieldLastTimeTex, velFieldTex) = (velFieldTex, velFieldLastTimeTex);
             CopyVelField(velFieldLastIterTex, velFieldLastTimeTex);
 
@@ -1110,7 +1249,7 @@ public class FvmSolverGpu : IFvmSolver
 
             if (cf.showSimulationTime)
             {
-                UnityEngine.Debug.Log($"Simulated physical time: {cf.currPhyTime:F2} seconds, consumed time: {stopwatch.ElapsedMilliseconds} ms.");
+                UnityEngine.Debug.Log($"Simulated physical time: {cf.currPhyTime:F3} seconds, consumed time: {stopwatch.ElapsedMilliseconds} ms.");
             }
 
             readyForRender = true;
@@ -1125,16 +1264,24 @@ public class FvmSolverGpu : IFvmSolver
         lesShader.SetTexture(eddyVisKernel, "velFieldLastTime", velFieldLastTimeTex);
         lesShader.SetTexture(eddyVisKernel, "eddyVisField", eddyVisFieldTex);
         lesShader.SetTexture(eddyVisKernel, "flagField", flagTex); // Read-only in les shader
-        SetBndTextures(lesShader, eddyVisKernel);
-        lesShader.Dispatch(eddyVisKernel, (velRes.x + 7) / 8, (velRes.y + 7) / 8, (velRes.z + 7) / 8);
+        SetBndTex(lesShader, eddyVisKernel);
+        if (cf.grid is NonUniformGridAuto or NonUniformGridDefault)
+        {
+            SetFacePosTex(lesShader, eddyVisKernel);
+        }
+        lesShader.Dispatch(eddyVisKernel, (gridRes.x + 7) / 8, (gridRes.y + 7) / 8, (gridRes.z + 7) / 8);
 
         lesShader.SetTexture(lesDeferCorrectTermKernel, "velFieldLastTime", velFieldLastTimeTex);
         lesShader.SetTexture(lesDeferCorrectTermKernel, "eddyVisField", eddyVisFieldTex);
         lesShader.SetTexture(lesDeferCorrectTermKernel, "faceEddyVisField", faceEddyVisFieldTex); // Read-only in les shader
         lesShader.SetTexture(lesDeferCorrectTermKernel, "bField", bFieldTex);
         lesShader.SetTexture(lesDeferCorrectTermKernel, "flagField", flagTex); // Read-only in les shader
-        SetBndTextures(lesShader, lesDeferCorrectTermKernel);
-        lesShader.Dispatch(lesDeferCorrectTermKernel, (velRes.x + 7) / 8, (velRes.y + 7) / 8, (velRes.z + 7) / 8);
+        SetBndTex(lesShader, lesDeferCorrectTermKernel);
+        if (cf.grid is NonUniformGridAuto or NonUniformGridDefault)
+        {
+            SetFacePosTex(lesShader, lesDeferCorrectTermKernel);
+        }
+        lesShader.Dispatch(lesDeferCorrectTermKernel, (gridRes.x + 7) / 8, (gridRes.y + 7) / 8, (gridRes.z + 7) / 8);
     }
 
     void CalWallFunc()
@@ -1142,75 +1289,50 @@ public class FvmSolverGpu : IFvmSolver
         wallFuncShader.SetTexture(calLogLawWallFuncKernel, "velFieldLastTime", velFieldLastTimeTex); // Read-only in wall func shader
         wallFuncShader.SetTexture(calLogLawWallFuncKernel, "faceEddyVisField", faceEddyVisFieldTex);
         wallFuncShader.SetTexture(calLogLawWallFuncKernel, "flagField", flagTex); // Read-only in wall func shader
-        SetBndTextures(wallFuncShader, calLogLawWallFuncKernel);
-        wallFuncShader.Dispatch(calLogLawWallFuncKernel, (velRes.x + 7) / 8, (velRes.y + 7) / 8, (velRes.z + 7) / 8);
+        SetBndTex(wallFuncShader, calLogLawWallFuncKernel);
+        if (cf.grid is NonUniformGridAuto or NonUniformGridDefault)
+        {
+            SetFacePosTex(wallFuncShader, calLogLawWallFuncKernel);
+        }
+        wallFuncShader.Dispatch(calLogLawWallFuncKernel, (gridRes.x + 7) / 8, (gridRes.y + 7) / 8, (gridRes.z + 7) / 8);
     }
 
     void _VelPredictPreCompute()
     {
-        if (cf.gridType == GridType.CollNonUniform)
+        if (cf.grid is NonUniformGridAuto or NonUniformGridDefault)
         {
-            fvmShader.SetBuffer(velPredictPreComputeKernel, "facePosX", facePosXBuf);
-            fvmShader.SetBuffer(velPredictPreComputeKernel, "facePosY", facePosYBuf);
-            fvmShader.SetBuffer(velPredictPreComputeKernel, "facePosZ", facePosZBuf);
+            SetFacePosTex(fvmShader, velPredictPreComputeKernel);
         }
 
         fvmShader.SetTexture(velPredictPreComputeKernel, "velFieldLastTime", velFieldLastTimeTex);
         fvmShader.SetTexture(velPredictPreComputeKernel, "presFieldLastTime", presFieldLastTimeTex);
-        //fvmShader.SetTexture(velPredictPreComputeKernel, "velFaceFluxField", velFaceFluxFieldTex);
+        fvmShader.SetTexture(velPredictPreComputeKernel, "massFluxField", massFluxFieldTex);
         fvmShader.SetTexture(velPredictPreComputeKernel, "flagField", flagTex);
         fvmShader.SetTexture(velPredictPreComputeKernel, "DField", DFieldTex);
         fvmShader.SetTexture(velPredictPreComputeKernel, "bField", bFieldTex);
         fvmShader.SetTexture(velPredictPreComputeKernel, "eddyVisField", eddyVisFieldTex); // Read-only in fvm shader
         fvmShader.SetTexture(velPredictPreComputeKernel, "faceEddyVisField", faceEddyVisFieldTex); // Read-only in les shader
-        SetBndTextures(fvmShader, velPredictPreComputeKernel);
-        fvmShader.Dispatch(velPredictPreComputeKernel, (velRes.x + 7) / 8, (velRes.y + 7) / 8, (velRes.z + 7) / 8);
+        SetBndTex(fvmShader, velPredictPreComputeKernel);
+        fvmShader.Dispatch(velPredictPreComputeKernel, (gridRes.x + 7) / 8, (gridRes.y + 7) / 8, (gridRes.z + 7) / 8);
     }
 
-    void _VelPredictColl()
+    void _VelPredict()
     {
-        fvmShader.SetTexture(computePredictedVelKernel, "velField", velFieldTex);
-        fvmShader.SetTexture(computePredictedVelKernel, "velFieldLastTime", velFieldLastTimeTex);
-        fvmShader.SetTexture(computePredictedVelKernel, "velFieldLastIter", velFieldLastIterTex);
-        fvmShader.SetTexture(computePredictedVelKernel, "presFieldLastTime", presFieldLastTimeTex);
-        fvmShader.SetTexture(computePredictedVelKernel, "flagField", flagTex);
-        fvmShader.SetTexture(computePredictedVelKernel, "DField", DFieldTex);
-        fvmShader.SetTexture(computePredictedVelKernel, "eddyVisField", eddyVisFieldTex); // Read-only in fvm shader
-        fvmShader.SetTexture(computePredictedVelKernel, "bField", bFieldTex);
-        SetBndTextures(fvmShader, computePredictedVelKernel);
-        fvmShader.Dispatch(computePredictedVelKernel, (velRes.x + 7) / 8, (velRes.y + 7) / 8, (velRes.z + 7) / 8);
-    }
-
-    void _VelPredictCollAccelerated()
-    {
-        if (cf.gridType == GridType.CollNonUniform)
+        if (cf.grid is NonUniformGridAuto or NonUniformGridDefault)
         {
-            fvmShader.SetBuffer(velPredictKernel, "facePosX", facePosXBuf);
-            fvmShader.SetBuffer(velPredictKernel, "facePosY", facePosYBuf);
-            fvmShader.SetBuffer(velPredictKernel, "facePosZ", facePosZBuf);
+            SetFacePosTex(fvmShader, velPredictKernel);
         }
 
         fvmShader.SetTexture(velPredictKernel, "velField", velFieldTex);
         fvmShader.SetTexture(velPredictKernel, "velFieldLastTime", velFieldLastTimeTex);
         fvmShader.SetTexture(velPredictKernel, "velFieldLastIter", velFieldLastIterTex);
-        //fvmShader.SetTexture(velPredictKernel, "velFaceFluxField", velFaceFluxFieldTex);
+        fvmShader.SetTexture(velPredictKernel, "massFluxField", massFluxFieldTex);
         fvmShader.SetTexture(velPredictKernel, "flagField", flagTex);
         fvmShader.SetTexture(velPredictKernel, "DField", DFieldTex);
         fvmShader.SetTexture(velPredictKernel, "bField", bFieldTex);
         fvmShader.SetTexture(velPredictKernel, "eddyVisField", eddyVisFieldTex); // Read-only
         fvmShader.SetTexture(velPredictKernel, "faceEddyVisField", faceEddyVisFieldTex); // Read-only
-        fvmShader.Dispatch(velPredictKernel, (velRes.x + 7) / 8, (velRes.y + 7) / 8, (velRes.z + 7) / 8);
-    }
-
-    void _VelPredictStagg()
-    {
-        fvmShader.SetTexture(computePredictedVelKernel, "velField", velFieldTex);
-        fvmShader.SetTexture(computePredictedVelKernel, "velFieldLastTime", velFieldLastTimeTex);
-        fvmShader.SetTexture(computePredictedVelKernel, "velFieldLastIter", velFieldLastIterTex);
-        fvmShader.SetTexture(computePredictedVelKernel, "presFieldLastTime", presFieldLastTimeTex);
-        fvmShader.SetTexture(computePredictedVelKernel, "flagField", flagTex);
-        fvmShader.SetTexture(computePredictedVelKernel, "DField", DFieldTex);
-        fvmShader.Dispatch(computePredictedVelKernel, (velRes.x + 7) / 8, (velRes.y + 7) / 8, (velRes.z + 7) / 8);
+        fvmShader.Dispatch(velPredictKernel, (gridRes.x + 7) / 8, (gridRes.y + 7) / 8, (gridRes.z + 7) / 8);
     }
 
     float _ComputeVelPredictResidual()
@@ -1235,6 +1357,35 @@ public class FvmSolverGpu : IFvmSolver
         return residual;
     }
 
+    void _ComputeMaxCfl()
+    {
+        if (cf.grid is NonUniformGridAuto or NonUniformGridDefault)
+            SetFacePosTex(fvmShader, calCflKernel);
+
+        fvmShader.SetTexture(calCflKernel, "velField", velFieldTex);
+        fvmShader.SetBuffer(calCflKernel, "gloCflBuf", gloCflBuf);
+        fvmShader.Dispatch(calCflKernel, numGroups.x, numGroups.y, numGroups.z);
+
+        int currStep = cf.currSimStep;
+
+        AsyncGPUReadback.Request(gloCflBuf, request =>
+        {
+            if (request.hasError)
+            {
+                UnityEngine.Debug.LogError("GPU CFL buffer readback error");
+                return;
+            }
+
+            var cflData = request.GetData<float>();
+            float maxCflCurrTimeStep = 0;
+            for (int i = 0; i < cflData.Length; i++)
+                maxCflCurrTimeStep = Mathf.Max(maxCflCurrTimeStep, cflData[i]);
+
+            maxCfl = Mathf.Max(maxCfl, maxCflCurrTimeStep);
+            UnityEngine.Debug.Log($"Max CFL at step {currStep}: {maxCflCurrTimeStep:F6}, Overall Max CFL: {maxCfl:F6}");
+        });
+    }
+
     bool VelPredict()
     {
         // ----- Vel prediction precompute -----
@@ -1244,7 +1395,7 @@ public class FvmSolverGpu : IFvmSolver
         for (int k = currItersInCurrSim; k < cf.velMaxNumIter; k++)
         {
             // ----- Solver -----
-            _VelPredictCollAccelerated();
+            _VelPredict();
 
             // ----- Calculate residual -----
             if (cf.calResidual)
@@ -1283,63 +1434,34 @@ public class FvmSolverGpu : IFvmSolver
 
     void _PresCorrectPreCompute()
     {
-        if (cf.gridType == GridType.CollNonUniform)
+        if (cf.grid is NonUniformGridAuto or NonUniformGridDefault)
         {
-            fvmShader.SetBuffer(presCorrectPreComputeKernel, "facePosX", facePosXBuf);
-            fvmShader.SetBuffer(presCorrectPreComputeKernel, "facePosY", facePosYBuf);
-            fvmShader.SetBuffer(presCorrectPreComputeKernel, "facePosZ", facePosZBuf);
+            SetFacePosTex(fvmShader, presCorrectPreComputeKernel);
         }
-
         fvmShader.SetTexture(presCorrectPreComputeKernel, "velField", velFieldTex);
         fvmShader.SetTexture(presCorrectPreComputeKernel, "presFieldLastTime", presFieldLastTimeTex);
-        fvmShader.SetTexture(presCorrectPreComputeKernel, "velFaceFluxField", velFaceFluxFieldTex);
+        fvmShader.SetTexture(presCorrectPreComputeKernel, "massFluxField", massFluxFieldTex);
         fvmShader.SetTexture(presCorrectPreComputeKernel, "flagField", flagTex);
         fvmShader.SetTexture(presCorrectPreComputeKernel, "DField", DFieldTex);
         fvmShader.SetTexture(presCorrectPreComputeKernel, "DFieldPresCorrect", DFieldPresCorrectTex);
         fvmShader.SetTexture(presCorrectPreComputeKernel, "bFieldPresCorrect", bFieldPresCorrectTex);
-        SetBndTextures(fvmShader, presCorrectPreComputeKernel);
-        fvmShader.Dispatch(presCorrectPreComputeKernel, (presRes.x + 7) / 8, (presRes.y + 7) / 8, (presRes.z + 7) / 8);
-    }
-
-    void _PresCorrectColl()
-    {
-        fvmShader.SetTexture(solvePresCorrectionKernel, "velField", velFieldTex);
-        fvmShader.SetTexture(solvePresCorrectionKernel, "presFieldLastTime", presFieldLastTimeTex);
-        fvmShader.SetTexture(solvePresCorrectionKernel, "presCorrectField", presCorrectFieldTex);
-        fvmShader.SetTexture(solvePresCorrectionKernel, "presCorrectFieldLastIter", presCorrectFieldLastIterTex);
-        fvmShader.SetTexture(solvePresCorrectionKernel, "flagField", flagTex);
-        fvmShader.SetTexture(solvePresCorrectionKernel, "DField", DFieldTex);
-        fvmShader.SetTexture(solvePresCorrectionKernel, "DFieldPresCorrect", DFieldPresCorrectTex);
-        SetBndTextures(fvmShader, solvePresCorrectionKernel);
-        fvmShader.Dispatch(solvePresCorrectionKernel, (presRes.x + 7) / 8, (presRes.y + 7) / 8, (presRes.z + 7) / 8);
+        SetBndTex(fvmShader, presCorrectPreComputeKernel);
+        fvmShader.Dispatch(presCorrectPreComputeKernel, (gridRes.x + 7) / 8, (gridRes.y + 7) / 8, (gridRes.z + 7) / 8);
     }
 
     void _PresCorrectCollAccelerated()
     {
-        if (cf.gridType == GridType.CollNonUniform)
+        if (cf.grid is NonUniformGridAuto or NonUniformGridDefault)
         {
-            fvmShader.SetBuffer(presCorrectKernel, "facePosX", facePosXBuf);
-            fvmShader.SetBuffer(presCorrectKernel, "facePosY", facePosYBuf);
-            fvmShader.SetBuffer(presCorrectKernel, "facePosZ", facePosZBuf);
+            SetFacePosTex(fvmShader, presCorrectKernel);
         }
-
         fvmShader.SetTexture(presCorrectKernel, "presCorrectField", presCorrectFieldTex);
         fvmShader.SetTexture(presCorrectKernel, "presCorrectFieldLastIter", presCorrectFieldLastIterTex);
         fvmShader.SetTexture(presCorrectKernel, "flagField", flagTex);
         fvmShader.SetTexture(presCorrectKernel, "DField", DFieldTex);
         fvmShader.SetTexture(presCorrectKernel, "DFieldPresCorrect", DFieldPresCorrectTex);
         fvmShader.SetTexture(presCorrectKernel, "bFieldPresCorrect", bFieldPresCorrectTex);
-        fvmShader.Dispatch(presCorrectKernel, (presRes.x + 7) / 8, (presRes.y + 7) / 8, (presRes.z + 7) / 8);
-    }
-
-    void _PresCorrectStag()
-    {
-        fvmShader.SetTexture(solvePresCorrectionKernel, "velField", velFieldTex);
-        fvmShader.SetTexture(solvePresCorrectionKernel, "presCorrectField", presCorrectFieldTex);
-        fvmShader.SetTexture(solvePresCorrectionKernel, "presCorrectFieldLastIter", presCorrectFieldLastIterTex);
-        fvmShader.SetTexture(solvePresCorrectionKernel, "flagField", flagTex);
-        fvmShader.SetTexture(solvePresCorrectionKernel, "DField", DFieldTex);
-        fvmShader.Dispatch(solvePresCorrectionKernel, (presRes.x + 7) / 8, (presRes.y + 7) / 8, (presRes.z + 7) / 8);
+        fvmShader.Dispatch(presCorrectKernel, (gridRes.x + 7) / 8, (gridRes.y + 7) / 8, (gridRes.z + 7) / 8);
     }
 
     float _ComputePresCorrectResidual()
@@ -1372,15 +1494,7 @@ public class FvmSolverGpu : IFvmSolver
         for (int k = currItersInCurrSim; k < cf.presMaxNumIter; k++)
         {
             // ----- Solve pressure correction kernel -----
-            _PresCorrectCollAccelerated();             
-
-            // ----- Apply pressure correction Neumann boundary condition -----
-            if (cf.gridType == GridType.Staggered)
-            {
-                fvmShader.SetTexture(neumannPresBndCondKernel, "presCorrectField", presCorrectFieldTex);
-                fvmShader.Dispatch(neumannPresBndCondKernel, (presRes.x + 7) / 8, (presRes.y + 7) / 8, (presRes.z + 7) / 8);
-            }
-            // ----- End of apply pressure correction Neumann boundary condition -----
+            _PresCorrectCollAccelerated();
 
             // Calculate residual
             if (cf.calResidual)
@@ -1388,6 +1502,7 @@ public class FvmSolverGpu : IFvmSolver
                 if (k % cf.presResidualCheckInterval == 0)
                 {
                     float residual = _ComputePresCorrectResidual();
+                    //UnityEngine.Debug.Log($"Residual of pres correct iteration {k}: {residual}");
 
                     if (residual < cf.presTolerance)
                     {
@@ -1418,7 +1533,7 @@ public class FvmSolverGpu : IFvmSolver
         fvmShader.SetTexture(applyPresCorrectionKernel, "presFieldLastTime", presFieldLastTimeTex); 
         fvmShader.SetTexture(applyPresCorrectionKernel, "presCorrectField", presCorrectFieldTex);
         fvmShader.SetTexture(applyPresCorrectionKernel, "flagField", flagTex);
-        fvmShader.Dispatch(applyPresCorrectionKernel, (presRes.x + 7) / 8, (presRes.y + 7) / 8, (presRes.z + 7) / 8);
+        fvmShader.Dispatch(applyPresCorrectionKernel, (gridRes.x + 7) / 8, (gridRes.y + 7) / 8, (gridRes.z + 7) / 8);
         // ----- End of update pressure field using correction -----
 
         // Don't apply pressure normalization if fixed value pressure bnd cond is used.
@@ -1432,7 +1547,7 @@ public class FvmSolverGpu : IFvmSolver
         {
             fvmShader.SetTexture(presNormalizationKernel, "presFieldLastTime", presFieldLastTimeTex);
             fvmShader.SetTexture(presNormalizationKernel, "flagField", flagTex);
-            fvmShader.Dispatch(presNormalizationKernel, (presRes.x + 7) / 8, (presRes.y + 7) / 8, (presRes.z + 7) / 8);
+            fvmShader.Dispatch(presNormalizationKernel, (gridRes.x + 7) / 8, (gridRes.y + 7) / 8, (gridRes.z + 7) / 8);
         }
 
         return true;
@@ -1440,43 +1555,18 @@ public class FvmSolverGpu : IFvmSolver
 
     void ApplyVelCorrection()
     {
-        if (cf.gridType == GridType.Collocated)
+        if (cf.grid is NonUniformGridAuto or NonUniformGridDefault)
         {
-            fvmShader.SetTexture(applyVelCorrectionKernel, "velField", velFieldTex);
-            fvmShader.SetTexture(applyVelCorrectionKernel, "velCorrectField", velCorrectFieldTex);
-            fvmShader.SetTexture(applyVelCorrectionKernel, "presCorrectField", presCorrectFieldTex);
-            fvmShader.SetTexture(applyVelCorrectionKernel, "flagField", flagTex);
-            fvmShader.SetTexture(applyVelCorrectionKernel, "DField", DFieldTex);
-
-            fvmShader.Dispatch(applyVelCorrectionKernel, (velRes.x + 7) / 8, (velRes.y + 7) / 8, (velRes.z + 7) / 8);
+            SetFacePosTex(fvmShader, applyVelCorrectionKernel);
         }
-        else if (cf.gridType == GridType.CollNonUniform)
-        {
-            fvmShader.SetBuffer(applyVelCorrectionKernel, "facePosX", facePosXBuf);
-            fvmShader.SetBuffer(applyVelCorrectionKernel, "facePosY", facePosYBuf);
-            fvmShader.SetBuffer(applyVelCorrectionKernel, "facePosZ", facePosZBuf);
+        fvmShader.SetTexture(applyVelCorrectionKernel, "velField", velFieldTex);
+        fvmShader.SetTexture(applyVelCorrectionKernel, "velCorrectField", velCorrectFieldTex);
+        fvmShader.SetTexture(applyVelCorrectionKernel, "presCorrectField", presCorrectFieldTex);
+        fvmShader.SetTexture(applyVelCorrectionKernel, "massFluxField", massFluxFieldTex);
+        fvmShader.SetTexture(applyVelCorrectionKernel, "flagField", flagTex);
+        fvmShader.SetTexture(applyVelCorrectionKernel, "DField", DFieldTex);
 
-            fvmShader.SetTexture(applyVelCorrectionKernel, "velField", velFieldTex);
-            fvmShader.SetTexture(applyVelCorrectionKernel, "velCorrectField", velCorrectFieldTex);
-            fvmShader.SetTexture(applyVelCorrectionKernel, "presCorrectField", presCorrectFieldTex);
-            fvmShader.SetTexture(applyVelCorrectionKernel, "flagField", flagTex);
-            fvmShader.SetTexture(applyVelCorrectionKernel, "DField", DFieldTex);
-
-            fvmShader.Dispatch(applyVelCorrectionKernel, (velRes.x + 7) / 8, (velRes.y + 7) / 8, (velRes.z + 7) / 8);
-        }
-        else if (cf.gridType == GridType.Staggered)
-        {
-            fvmShader.SetTexture(applyVelCorrectionKernel, "velField", velFieldTex);
-            fvmShader.SetTexture(applyVelCorrectionKernel, "presCorrectField", presCorrectFieldTex);
-            fvmShader.SetTexture(applyVelCorrectionKernel, "flagField", flagTex);
-            fvmShader.SetTexture(applyVelCorrectionKernel, "DField", DFieldTex);
-
-            fvmShader.Dispatch(applyVelCorrectionKernel, (velRes.x + 7) / 8, (velRes.y + 7) / 8, (velRes.z + 7) / 8);
-        }
-        else
-        {
-            throw new NotImplementedException("ApplyVelCorrection not implemented for current grid type.");
-        }
+        fvmShader.Dispatch(applyVelCorrectionKernel, (gridRes.x + 7) / 8, (gridRes.y + 7) / 8, (gridRes.z + 7) / 8);
     }
 
     void PisoCorrection()
@@ -1487,19 +1577,19 @@ public class FvmSolverGpu : IFvmSolver
         pisoShader.SetTexture(pisoCalAodUCorrectKernel, "velCorrectField", velCorrectFieldTex);
         pisoShader.SetTexture(pisoCalAodUCorrectKernel, "flagField", flagTex);
         pisoShader.SetTexture(pisoCalAodUCorrectKernel, "DField", DFieldTex);
-        pisoShader.Dispatch(pisoCalAodUCorrectKernel, (velRes.x + 7) / 8, (velRes.y + 7) / 8, (velRes.z + 7) / 8);
+        pisoShader.Dispatch(pisoCalAodUCorrectKernel, (gridRes.x + 7) / 8, (gridRes.y + 7) / 8, (gridRes.z + 7) / 8);
 
         // ----- Compute pressure correction -----
         for (int k = 0; k < cf.presMaxNumIter; k++)
         {
-            if (cf.gridType == GridType.Collocated)
+            if (cf.grid is UniformGrid)
             {
                 pisoShader.SetTexture(pisoPresCorrectionKernel, "AodUCorrectField", AodUCorrectFieldTex);
                 pisoShader.SetTexture(pisoPresCorrectionKernel, "presCorrectField", presCorrectFieldTex);
                 pisoShader.SetTexture(pisoPresCorrectionKernel, "presCorrectFieldLastIter", presCorrectFieldLastIterTex);
                 pisoShader.SetTexture(pisoPresCorrectionKernel, "flagField", flagTex);
                 pisoShader.SetTexture(pisoPresCorrectionKernel, "DField", DFieldTex);
-                pisoShader.Dispatch(pisoPresCorrectionKernel, (presRes.x + 7) / 8, (presRes.y + 7) / 8, (presRes.z + 7) / 8);
+                pisoShader.Dispatch(pisoPresCorrectionKernel, (gridRes.x + 7) / 8, (gridRes.y + 7) / 8, (gridRes.z + 7) / 8);
             }
             else
             {
@@ -1517,7 +1607,7 @@ public class FvmSolverGpu : IFvmSolver
         pisoShader.SetTexture(pisoApplyPresCorrectionKernel, "presFieldLastTime", presFieldLastTimeTex);
         pisoShader.SetTexture(pisoApplyPresCorrectionKernel, "presCorrectField", presCorrectFieldTex);
         pisoShader.SetTexture(pisoApplyPresCorrectionKernel, "flagField", flagTex);
-        pisoShader.Dispatch(pisoApplyPresCorrectionKernel, (presRes.x + 7) / 8, (presRes.y + 7) / 8, (presRes.z + 7) / 8);
+        pisoShader.Dispatch(pisoApplyPresCorrectionKernel, (gridRes.x + 7) / 8, (gridRes.y + 7) / 8, (gridRes.z + 7) / 8);
 
         // ----- Update velocity field -----
         pisoShader.SetTexture(pisoVelCorrectionKernel, "velField", velFieldTex);
@@ -1526,7 +1616,7 @@ public class FvmSolverGpu : IFvmSolver
         pisoShader.SetTexture(pisoVelCorrectionKernel, "AodUCorrectField", AodUCorrectFieldTex);
         pisoShader.SetTexture(pisoVelCorrectionKernel, "flagField", flagTex);
         pisoShader.SetTexture(pisoVelCorrectionKernel, "DField", DFieldTex);
-        pisoShader.Dispatch(pisoVelCorrectionKernel, (velRes.x + 7) / 8, (velRes.y + 7) / 8, (velRes.z + 7) / 8);
+        pisoShader.Dispatch(pisoVelCorrectionKernel, (gridRes.x + 7) / 8, (gridRes.y + 7) / 8, (gridRes.z + 7) / 8);
 
         // ----- Reset presCorrectField to zero -----
         SetPresCorrectFieldtoZero();
@@ -1539,7 +1629,7 @@ public class FvmSolverGpu : IFvmSolver
         utilsShader.SetTexture(copyVelFieldKernel, "destVel", destVel);
         utilsShader.SetTexture(copyVelFieldKernel, "srcVel", srcVel);
 
-        utilsShader.Dispatch(copyVelFieldKernel, (velRes.x + 7) / 8, (velRes.y + 7) / 8, (velRes.z + 7) / 8);
+        utilsShader.Dispatch(copyVelFieldKernel, (gridRes.x + 7) / 8, (gridRes.y + 7) / 8, (gridRes.z + 7) / 8);
     }
 
     void SetPresCorrectFieldtoZero()
@@ -1547,13 +1637,13 @@ public class FvmSolverGpu : IFvmSolver
         utilsShader.SetFloat("presValue", 0f);
 
         utilsShader.SetTexture(setPresFieldKernel, "destPres", presCorrectFieldTex);
-        utilsShader.Dispatch(setPresFieldKernel, (presRes.x + 7) / 8, (presRes.y + 7) / 8, (presRes.z + 7) / 8);
+        utilsShader.Dispatch(setPresFieldKernel, (gridRes.x + 7) / 8, (gridRes.y + 7) / 8, (gridRes.z + 7) / 8);
 
         utilsShader.SetTexture(setPresFieldKernel, "destPres", presCorrectFieldLastIterTex);
-        utilsShader.Dispatch(setPresFieldKernel, (presRes.x + 7) / 8, (presRes.y + 7) / 8, (presRes.z + 7) / 8);
+        utilsShader.Dispatch(setPresFieldKernel, (gridRes.x + 7) / 8, (gridRes.y + 7) / 8, (gridRes.z + 7) / 8);
     }
 
-    void SetBndTextures(ComputeShader shader, int kernel)
+    void SetBndTex(ComputeShader shader, int kernel)
     {
         shader.SetTexture(kernel, "bndFieldX0", bndX0Tex);
         shader.SetTexture(kernel, "bndFieldXn", bndXnTex);
@@ -1561,6 +1651,13 @@ public class FvmSolverGpu : IFvmSolver
         shader.SetTexture(kernel, "bndFieldYn", bndYnTex);
         shader.SetTexture(kernel, "bndFieldZ0", bndZ0Tex);
         shader.SetTexture(kernel, "bndFieldZn", bndZnTex);
+    }
+
+    void SetFacePosTex(ComputeShader shader, int kernel)
+    {
+        shader.SetBuffer(kernel, "facePosX", facePosXBuf);
+        shader.SetBuffer(kernel, "facePosY", facePosYBuf);
+        shader.SetBuffer(kernel, "facePosZ", facePosZBuf);
     }
     #endregion
 
@@ -1580,5 +1677,21 @@ public class FvmSolverGpu : IFvmSolver
     {
         return flagTex;
     }
+
+    public float[] GetFacePosXArray()
+    {
+        return facePosXArray;
+    }
+
+    public float[] GetFacePosYArray()
+    {
+        return facePosYArray;
+    }
+
+    public float[] GetFacePosZArray()
+    {
+        return facePosZArray;
+    }
+
     #endregion
 }

@@ -1,17 +1,11 @@
-using Unity.Mathematics;
-using UnityEngine;
 using System;
+using System.Collections.Generic;
 using System.IO;
-
-using static UnityEngine.Rendering.HighDefinition.ScalableSettingLevelParameter;
+using Unity.Mathematics;
+using Unity.VisualScripting;
+using UnityEngine;
 using UnityEngine.UIElements;
-
-public enum GridType
-{
-    Collocated,
-    CollNonUniform,
-    Staggered,
-}
+using static UnityEngine.Rendering.HighDefinition.ScalableSettingLevelParameter;
 
 public enum VelBndCond
 {
@@ -53,10 +47,11 @@ public enum Mode
     OutputBuildingVoxels,
 }
 
-public enum ConvectionScheme
+public enum ConvectScheme
 {
     CDS,
     UDS,
+    LUST,
 }
 
 public enum FaceVelInterpScheme
@@ -95,6 +90,55 @@ public enum VisualizeMode
     ZeroCopy,
 }
 
+public enum SampleAxis
+{
+    X,
+    Y,
+    Z
+}
+
+[Serializable]
+public abstract class Grid
+{
+}
+
+[Serializable]
+public class UniformGrid : Grid
+{
+    public float3 physDomainSize = new(80f, 40f, 40f);
+    public int numCellsX = 80;
+}
+
+[Serializable]
+public class NonUniformGridAuto : Grid
+{
+    public float3 unifRegionPhysDomainSize = new(200f, 20f, 200f);
+    public int unifRegionNumCellsX = 8;
+    public float3 stretchFactor = new(1.08f, 1.08f, 1.08f);
+}
+
+[Serializable]
+public class NonUniformGridDefault : Grid
+{
+    public float3 userDefinedPhysDomainSize = new(80, 40, 40);
+    public float3 unifRegionPhysStartOffset = new(20f, 0f, 18f);
+    public float3 unifRegionPhysDomainSize = new(4f, 8f, 4f);
+    public int unifRegionNumCellsX = 8;
+    public float3 stretchFactor = new(1.08f, 1.08f, 1.08f);
+
+    public float3 userBoxStartPhysOffset = new(20f, 0f, 18f);
+    public float3 userBoxEndPhysOffset = new(24f, 8f, 22f);
+}
+
+[Serializable]
+public class SampleLineConfig
+{
+    public SampleAxis sampleAxis = SampleAxis.Y;
+    public Vector2 fixedCoords = new(25f, 20f);
+    public Vector2 sampleRange = new(0.25f, 39.75f);
+    public int numSamples = 80;
+}
+
 
 [CreateAssetMenu(fileName = "FluidSimConfig", menuName = "Simulation/FluidSimConfig")]
 public class FluidSimConfig : ScriptableObject
@@ -109,17 +153,15 @@ public class FluidSimConfig : ScriptableObject
     #endregion
 
     #region SimulationParameters
+
+    [SerializeReference, SubclassSelector]
+    public Grid grid = new UniformGrid();
+
     [Header("Simulation Parameters")]
-    public float3 physDomainSize = new(10f, 5f, 10f);
-    public int gridResX = 100;
+
     public float dt = 0.1f;
     public float mu = 0.005f; // Dynamic viscosity
     public float den = 1.0f;
-    [Tooltip("Only used when inflowType is Jet")]
-    public float Umax = 0.5f; // Maximum velocity for jet flow
-    [Tooltip("Only used when inflowType is Jet")]
-    public int2 R = new(10, 10); // Radius of the jet inlet
-    public int2 jetCenter = new(25, 50);
     public float3 externalForce = new(0f, 0f, 0f);
 
     [Header("Velocity boundary conditions")]
@@ -143,7 +185,7 @@ public class FluidSimConfig : ScriptableObject
 
     private float _dirichletVelX = 0.0f;
     public SolidType solidType = SolidType.NoSolid;
-    public ConvectionScheme convectionScheme = ConvectionScheme.CDS;
+    public ConvectScheme convectScheme = ConvectScheme.CDS;
     public FaceVelInterpScheme faceVelInterpScheme = FaceVelInterpScheme.RhieChow;
     public FvmSolverType fvmSolverType = FvmSolverType.SIMPLE;
     public int PISONumCorrectors = 2;
@@ -158,16 +200,13 @@ public class FluidSimConfig : ScriptableObject
     }
     #endregion
 
-    #region GridParameters
-    public GridType gridType = GridType.Collocated;
-    #endregion
-
     #region BackGroundFlowParameters
     bool isBackGroundFlow = false;
     #endregion
 
     #region MatrixSolverParameters
     public bool calResidual = false;
+    public bool calMaxCfl = false;
 
     public int velResidualCheckInterval = 10;
     public float velTolerance = 1e-15f;
@@ -205,28 +244,12 @@ public class FluidSimConfig : ScriptableObject
     #endregion
 
     #region DeducedParameters
-    private float _dx;
-    private float _ds;
-    private float _dv;
-    private int3 _gridRes; // User-defined grid resolution.
-    private int3 _presRes; // Pressure grid resolution.
-    private int3 _velRes; // Velocity grid resolution.
     private float _nu; // Kinematic viscosity
-    private float _D; // Diagonal coefficients of velocity prediction coefficients matrix
-    private float _DInv; // Inverse of D
     private float _currPhyTime = 0; // Current simulated physics time
     private int _currSimStep = 0; // Current total simulated steps.
     private int _numStepsSaved = 0; // Number of steps saved.
 
-    public float dx => _dx;
-    public float ds => _ds;
-    public float dv => _dv;
-    public int3 gridRes => _gridRes;
-    public int3 presRes => _presRes;
-    public int3 velRes => _velRes;
     public float nu => _nu;
-    public float D => _D;
-    public float DInv => _DInv;
     public float currPhyTime
     {
         get => _currPhyTime;
@@ -246,8 +269,18 @@ public class FluidSimConfig : ScriptableObject
 
     #region SolidParameters
     [Header("Solid Parameters")]
-    public float3 boxStart = new(0.4f, 0.4f, 0.4f);
-    public float3 boxEnd = new(0.6f, 0.6f, 0.6f);
+    private int3 _boxStartIdx;
+    private int3 _boxEndIdx;
+    public int3 boxStartIdx
+    {
+        get => _boxStartIdx;
+        set => _boxStartIdx = value;
+    }
+    public int3 boxEndIdx
+    {
+        get => _boxEndIdx;
+        set => _boxEndIdx = value;
+    }
     public VoxelizerType voxelizerType = VoxelizerType.YDirFromTop;
     [Tooltip("Whether to attach the fluid field to model bottom")]
     public bool attachFieldToModelBottom = false;
@@ -281,21 +314,33 @@ public class FluidSimConfig : ScriptableObject
     [Header("Save NetCDF Parameters")]
     public bool saveVelField = false;
     public bool savePresField = false;
+    public bool saveSampleLine = false;
     [Tooltip("If false, files will be saved to /Data by default")]
     public bool useAbsSaveDir = false;
     [Tooltip("Only valid if useAbsSavePath is true")]
     public string absSaveDir = "D:/Projects/Unity/UnityProjects/TestWindNoiseSimulation/Data";
     private string fileName = null;
     private string _savePath = null;
+    private string _savePath2 = null;
     public int saveBeginStep = 1000;
     public int saveInterval = 1000;
     public string flagFileName = null;
     private string _flagSavePath = null;
 
+    // ----- Sample lines -----
+    public int sampleLineSaveBeginStep = 0;
+    public int sampleLineSaveInterval = 10;
+    public List<SampleLineConfig> sampleLines = new List<SampleLineConfig>();
+
     public string savePath
     {
         get => _savePath;
         set => _savePath = value;
+    }
+    public string savePath2
+    {
+        get => _savePath2;
+        set => _savePath2 = value;
     }
     public string flagSavePath
     {
@@ -319,27 +364,34 @@ public class FluidSimConfig : ScriptableObject
     }
     #endregion
 
+    // ----- l: physical size of a stretched grid block, r: stretch factor, dx: init cell size at
+    // solid boundary. -----
+    private int _CalcNonUnifGridCellNum(float l, float r, float dx)
+    {
+        if (Mathf.Abs(r - 1) < 1e-5)
+            return Mathf.RoundToInt(l / dx);
+        else
+            return Mathf.CeilToInt(Mathf.Log(1 - l * (1 - r) / dx) / Mathf.Log(r));
+    }
+
+    // ----- l: specified physical size of a stretched grid block, r: stretch factor, dx: init
+    // cell size at solid boundary, n: number of cells. -----
+    private float _CalNonUnifGridRegionSize(float l, float r, float dx, float n)
+    {
+        if (Mathf.Abs(r - 1) < 1e-5)
+            return l;
+        else
+            return dx * (1 - Mathf.Pow(r, n)) / (1 - r);
+    }
+
+    private void _InitNonUnifGridOpenFOAMConfig()
+    {
+        throw new NotImplementedException();
+    }
+
     public void Init()
     {
-        // Calculate derived parameters based on the user-defined parameters.
-        _dx = physDomainSize.x / gridResX;
-        _ds = _dx * _dx;
-        _dv = _dx * _dx * _dx;
-
-        int gridResY = Mathf.RoundToInt(physDomainSize.y / _dx);
-        int gridResZ = Mathf.RoundToInt(physDomainSize.z / _dx);
-
-        _gridRes = new int3(gridResX, gridResY, gridResZ);
-        _presRes = new int3(gridResX, gridResY, gridResZ);
-        if (gridType == GridType.Collocated)
-            _velRes = new int3(gridResX, gridResY, gridResZ);
-        else
-            _velRes = new int3(gridResX + 1, gridResY + 1, gridResZ + 1);
-
         _nu = mu / den;
-
-        _D = _dv / dt + 6 * _nu * _ds / _dx;
-        _DInv = 1 / (_dv / dt + 6 * _nu * _ds / _dx);
 
         _currPhyTime = 0; // Current simulated physics time
         _currSimStep = 0; // Current total simulated steps.
@@ -358,7 +410,10 @@ public class FluidSimConfig : ScriptableObject
 
         fileName = $"Field_{DateTime.Now:yyyyMMdd_HHmmss}.nc";
 
+        string fileName2 = $"Field_{DateTime.Now:yyyyMMdd_HHmmss}_sampleline.nc";
+
         _savePath = Path.Combine(saveDir, fileName);
+        _savePath2 = Path.Combine(saveDir, fileName2);
         _flagSavePath = Path.Combine(saveDir, flagFileName);
 
         if (useAbsReadDir)

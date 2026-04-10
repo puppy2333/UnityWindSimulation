@@ -13,11 +13,46 @@ MonoBehaviour:
   m_Name: AijBuilding01608080
   m_EditorClassIdentifier: 
   mode: 0
+  gridType: 1
+  nonUnifGridConfigType: 0
   physDomainSize:
     x: 80
     y: 40
     z: 40
-  gridResX: 160
+  numCellsX: 160
+  unifRegionStartPhysOffset:
+    x: 20
+    y: 0
+    z: 18
+  unifRegionEndPhysOffset:
+    x: 24
+    y: 8
+    z: 22
+  unifRegionNumCellsX: 8
+  stretchFactor:
+    x: 1
+    y: 1
+    z: 1
+  numCells:
+    x: 90
+    y: 74
+    z: 74
+  unifRegionStartCellOffset:
+    x: 29
+    y: 0
+    z: 27
+  unifRegionEndCellOffset:
+    x: 49
+    y: 40
+    z: 47
+  stretchRatioStart:
+    x: 0.116
+    y: 1
+    z: 0.135
+  stretchRatioEnd:
+    x: 21.7
+    y: 12.7
+    z: 7.4
   dt: 0.02
   mu: 0.000015
   den: 1
@@ -53,25 +88,25 @@ MonoBehaviour:
     y: 0
     z: 0
   solidType: 1
-  convectionScheme: 0
+  convectScheme: 2
   faceVelInterpScheme: 0
   fvmSolverType: 0
   PISONumCorrectors: 2
   turbulenceModel: 1
-  smagorinskyConstant: 0.15
-  inflowType: 0
-  gridType: 0
+  smagorinskyConstant: 0.18
+  inflowType: 1
   calResidual: 1
   velResidualCheckInterval: 50
   velTolerance: 0.00001
-  velMaxNumIter: 100
+  velMaxNumIter: 400
   presResidualCheckInterval: 50
   presTolerance: 0.00001
-  presMaxNumIter: 1000
+  presMaxNumIter: 2000
+  visualizeMode: 0
   colorMap: 0
   showVelocityField: 1
   showPressureField: 0
-  showFlagField: 1
+  showFlagField: 0
   showVfx: 1
   vFxArrowLengthFollowVelMag: 1
   ySlice: 20
@@ -85,14 +120,14 @@ MonoBehaviour:
   showDomainBoundary: 1
   visScale: 1
   visInterpolateType: 0
-  boxStart:
-    x: 0.25
+  boxStartPhysOffset:
+    x: 20
     y: 0
-    z: 0.45
-  boxEnd:
-    x: 0.3
-    y: 0.2
-    z: 0.55
+    z: 18
+  boxEndPhysOffset:
+    x: 24
+    y: 8
+    z: 22
   voxelizerType: 0
   attachFieldToModelBottom: 0
   simulateGround: 0
@@ -106,10 +141,10 @@ MonoBehaviour:
   timeSliderPos: {x: 0, y: 50}
   timeSliderSize: {x: 300, y: 20}
   saveVelField: 1
-  savePresField: 1
+  savePresField: 0
   useAbsSaveDir: 0
   absSaveDir: D:/Projects/Unity/UnityProjects/TestWindNoiseSimulation/Data
-  saveBeginStep: 5000
+  saveBeginStep: 15000
   saveInterval: 100
   flagFileName: BuildingGroupFloor
   useAbsReadDir: 0

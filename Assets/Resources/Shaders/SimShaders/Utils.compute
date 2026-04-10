@@ -14,15 +14,15 @@ RWTexture3D<float> srcPres;
 float presValue;
 
 int3 gridRes;
-int3 velRes;
-int3 presRes;
+//int3 velRes;
+//int3 presRes;
 
 [numthreads(8,8,8)]
 void CSCopyVelField (uint3 id : SV_DispatchThreadID)
 {
     int x = id.x, y = id.y, z = id.z;
     
-    if (x >= velRes.x || y >= velRes.y || z >= velRes.z)
+    if (x >= gridRes.x || y >= gridRes.y || z >= gridRes.z)
         return;
     
     destVel[id] = srcVel[id];
@@ -33,7 +33,7 @@ void CSSetPresField(uint3 id : SV_DispatchThreadID)
 {
     int x = id.x, y = id.y, z = id.z;
     
-    if (x >= presRes.x || y >= presRes.y || z >= presRes.z)
+    if (x >= gridRes.x || y >= gridRes.y || z >= gridRes.z)
         return;
     
     destPres[id] = presValue;

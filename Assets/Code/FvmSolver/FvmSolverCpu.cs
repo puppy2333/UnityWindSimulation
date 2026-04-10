@@ -35,7 +35,7 @@ public class FvmSolverCpu : IFvmSolver
 
     private Stopwatch stopwatch = new Stopwatch();
 
-    public FvmSolverCpu(FluidSimConfig config)
+    public FvmSolverCpu(FluidSimConfig config, RuntimeConfig rcf)
     {
         // Load configuration file.
         if (config == null)
@@ -46,12 +46,12 @@ public class FvmSolverCpu : IFvmSolver
         cf = config;
         cf.Init();
 
-        physicalDomainSize = config.physDomainSize;
-        gridResX = config.gridResX;
+        physicalDomainSize = rcf.physDomainSize;
+        gridResX = rcf.numCells.x;
         dt = config.dt;
         mu = config.mu;
         den = config.den;
-        Umax = config.Umax;
+        Umax = 10;
         externalForce = config.externalForce;
 
         // Init fluid simulation parameters.
@@ -160,9 +160,9 @@ public class FvmSolverCpu : IFvmSolver
             for (int y = 0; y < gridRes.y; y++)
             {
                 float r = math.sqrt((y - y0) * (y - y0) + (z - z0) * (z - z0));
-                if (r <= cf.R.x)
+                if (r <= 10)
                 {
-                    float U = Umax * (1 - math.pow(r / cf.R.x, 2));
+                    float U = Umax * (1 - math.pow(r / 10, 2));
                     velField[0, y, z] = new float3(U, 0f, 0f);
                 }
             }
@@ -366,6 +366,11 @@ public class FvmSolverCpu : IFvmSolver
         UnityEngine.Debug.LogWarning("InitBuilding is not implemented for FvmSolverCpu.");
     }
 
+    public void InitNonUnifGridAuto(FluidSimConfig cfIn, RuntimeConfig rcfIn)
+    {
+        throw new NotImplementedException();
+    }
+
     public void InitFlags(int[] flags)
     {
         throw new NotImplementedException();
@@ -391,12 +396,32 @@ public class FvmSolverCpu : IFvmSolver
         throw new NotImplementedException();
     }
 
-    public void InitVelPresFieldsFromBackGroundFlow(FluidSimConfig cfBackGround, RenderTexture velTexBackGround, RenderTexture presTexBackGround)
+    public void InitVelPresFieldsFromBackGroundFlow(FluidSimConfig cfBG, RuntimeConfig rcfBG, RenderTexture velTexBackGround, RenderTexture presTexBackGround)
     {
         throw new NotImplementedException();
     }
 
     public void SetFixedValueVelBndCond()
+    {
+        throw new NotImplementedException();
+    }
+
+    public float[] GetFacePosXArray()
+    {
+        return null;
+    }
+
+    public float[] GetFacePosYArray()
+    {
+        return null;
+    }
+
+    public float[] GetFacePosZArray()
+    {
+        return null;
+    }
+
+    public void InitNonUnifGridFlags(int[] flagsUnif)
     {
         throw new NotImplementedException();
     }
